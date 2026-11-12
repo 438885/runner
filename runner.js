@@ -57,6 +57,22 @@
           <h3 class="text-lg font-bold text-zinc-100 tracking-tight">TypeScript & Python Runner</h3>
           <span class="text-xs bg-blue-500/10 text-blue-400 border border-blue-500/20 px-2 py-0.5 rounded">Tailwind v4 JIT</span>
         </div>
+
+        <div class="p-5 border border-zinc-700/80 rounded-lg bg-zinc-800/50 flex flex-col gap-3">
+          <div class="flex items-center justify-between">
+            <label for="builtinSelect" class="text-sm font-medium text-zinc-200">
+              📦 Select Built-in or Loaded Project (HTML, JS, TS, Python):
+            </label>
+            <button id="refreshBuiltinBtn" class="${btnSec}" title="Rescan built-in folders & URLs">↻ Refresh</button>
+          </div>
+          <div class="flex gap-2">
+            <select id="builtinSelect" class="flex-1 bg-zinc-900 border border-zinc-700 text-zinc-200 text-xs rounded-md px-3 py-2 outline-none focus:border-blue-500 cursor-pointer disabled:opacity-40">
+              <option value="">Scanning built-in projects...</option>
+            </select>
+            <button id="loadBuiltinBtn" class="${btnPri}" disabled>▶ Run Selected</button>
+          </div>
+        </div>
+
         <div class="p-5 border-2 border-dashed border-zinc-700 hover:border-indigo-500 rounded-lg bg-zinc-800/40 transition">
           <label class="text-sm font-medium text-zinc-300 block cursor-pointer">
             Upload Files (.ts, .tsx, .js, .py, .css, .html, assets, .zip):
@@ -77,10 +93,10 @@
       <div id="runnerViewport" class="hidden fixed inset-0 w-screen h-screen z-50 bg-black flex-col">
         <header id="topbar" class="relative h-11 bg-zinc-900 border-b border-zinc-800 flex items-center justify-between px-3 gap-2 shrink-0 select-none z-50">
           <div class="flex items-center gap-2">
-            <button id="backBtn" class="${btnSec}" title="Back to uploads">📁 Uploads</button>
-            <span class="text-xs font-semibold text-zinc-400">Entry:</span>
-            <select id="entrySelect" disabled class="bg-zinc-800 border border-zinc-700 text-zinc-200 text-xs rounded-md px-2.5 py-1 outline-none focus:border-blue-500 cursor-pointer disabled:opacity-40">
-              <option>No files uploaded</option>
+            <button id="backBtn" class="${btnSec}" title="Back to uploads & project selector">📁 Projects</button>
+            <span class="text-xs font-semibold text-zinc-400">Script:</span>
+            <select id="entrySelect" disabled class="max-w-xs bg-zinc-800 border border-zinc-700 text-zinc-200 text-xs rounded-md px-2.5 py-1 outline-none focus:border-blue-500 cursor-pointer disabled:opacity-40">
+              <option>Loading projects...</option>
             </select>
             <button id="runBtn" class="${btnPri}" disabled>▶ Run</button>
             <button id="stopBtn" class="${btnDanger}" disabled>⏹ Stop</button>
@@ -105,7 +121,7 @@
               <button id="closeLogsBtn" class="px-2 py-0.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border border-zinc-700">✕ Close</button>
             </div>
           </div>
-          <pre id="logs" class="flex-1 p-3 font-mono text-xs text-zinc-300 overflow-auto whitespace-pre-wrap break-all leading-relaxed">Waiting for files...</pre>
+          <pre id="logs" class="flex-1 p-3 font-mono text-xs text-zinc-300 overflow-auto whitespace-pre-wrap break-all leading-relaxed">Waiting for selection or files...</pre>
         </div>
       </div>
     `;
@@ -117,6 +133,7 @@
     const $ = (id) => document.getElementById(id);
     const refs = {
       fileInput: $("fileInput"), folderInput: $("folderInput"), entrySelect: $("entrySelect"),
+      builtinSelect: $("builtinSelect"), loadBuiltinBtn: $("loadBuiltinBtn"), refreshBuiltinBtn: $("refreshBuiltinBtn"),
       runBtn: $("runBtn"), stopBtn: $("stopBtn"), downloadBtn: $("downloadBtn"), clearBtn: $("clearBtn"),
       sandbox: $("sandbox"), canvasContainer: $("canvasContainer"), logsEl: $("logs"),
       runnerViewport: $("runnerViewport"), mainDashboard: $("mainDashboard"), backBtn: $("backBtn"),
@@ -140,17 +157,61 @@
   const Logger = (() => {
     let logBuf = [], raf = null;
 
+    const ts = () => {
+      const d = new Date();
+      return d.toTimeString().split(" ")[0] + "." + String(d.getMilliseconds()).padStart(3, "0");
+    };
+
+    const formatVal = (v, seen = new WeakSet()) => {
+      if (v === null) return "null";
+      if (v === undefined) return "undefined";
+      if (typeof v === "string") return v;
+      if (typeof v === "number" || typeof v === "boolean" || typeof v === "bigint" || typeof v === "symbol") return String(v);
+      if (v instanceof Error) return v.stack || `${v.name}: ${v.message}`;
+      if (typeof v === "function") return `[Function: ${v.name || "anonymous"}]`;
+      if (typeof v === "object") {
+        if (seen.has(v)) return "[Circular]";
+        seen.add(v);
+        try {
+          return JSON.stringify(v, (_, val) => {
+            if (typeof val === "bigint") return `${val}n`;
+            if (typeof val === "symbol") return String(val);
+            if (typeof val === "function") return `[Function: ${val.name || "anonymous"}]`;
+            if (val instanceof Error) return { name: val.name, message: val.message, stack: val.stack };
+            if (val instanceof Map) return { __type: "Map", entries: [...val.entries()] };
+            if (val instanceof Set) return { __type: "Set", values: [...val.values()] };
+            if (val instanceof RegExp) return val.toString();
+            if (typeof val === "object" && val !== null) {
+              if (seen.has(val) && val !== v) return "[Circular]";
+              seen.add(val);
+            }
+            return val;
+          });
+        } catch {
+          return Object.prototype.toString.call(v);
+        }
+      }
+      return String(v);
+    };
+
     const flush = () => {
       if (!logBuf.length) return;
       const comb = DOM.logsEl.textContent + logBuf.join("\n") + "\n";
-      DOM.logsEl.textContent = comb.length > 1e5 ? "...[truncated]...\n" + comb.slice(-1e5) : comb;
+      DOM.logsEl.textContent = comb.length > 250000 ? "...[truncated]...\n" + comb.slice(-250000) : comb;
       logBuf = [];
       raf = null;
       DOM.logsEl.scrollTop = DOM.logsEl.scrollHeight;
     };
 
-    const log = (m) => {
-      logBuf.push(String(m ?? "").replace(/\n$/, ""));
+    const log = (m, level = "") => {
+      const raw = String(m ?? "").replace(/\n$/, "");
+      if (!raw) return;
+      const hasBracket = /^\[[A-Z0-9_:-]+\]/i.test(raw);
+      const tag = level ? `[${level.toUpperCase()}] ` : hasBracket ? "" : "[SYS] ";
+      const prefix = `[${ts()}] ${tag}`;
+      const indent = " ".repeat(prefix.length);
+      const lines = raw.split("\n").map((line, i) => (i === 0 ? `${prefix}${line}` : `${indent}${line}`));
+      logBuf.push(lines.join("\n"));
       raf = raf || requestAnimationFrame(flush);
     };
 
@@ -160,13 +221,31 @@
       DOM.logsEl.textContent = "";
     };
 
-    window.addEventListener("message", ({ source, data }) => {
-      if (source === DOM.sandbox.contentWindow && data?.type === "SANDBOX_LOG") {
-        log(`[${String(data.level || "LOG").toUpperCase()}] ${(Array.isArray(data.messages) ? data.messages : [data.messages ?? ""]).join(" ")}`);
+    window.addEventListener("message", ({ data }) => {
+      if (data?.type === "SANDBOX_LOG") {
+        const lvl = String(data.level || "LOG").toUpperCase();
+        const msgs = Array.isArray(data.messages) ? data.messages.map((x) => formatVal(x)) : [formatVal(data.messages ?? "")];
+        log(msgs.join(" "), lvl);
       }
     });
 
-    return { log, flush, clear };
+    window.addEventListener("error", (e) => {
+      if (e.target && e.target !== window) {
+        const el = e.target;
+        const src = el.src || el.href || "";
+        if (src) log(`Host resource failed to load: <${el.tagName?.toLowerCase() || "asset"}> ${src}`, "HOST_WARN");
+        return;
+      }
+      const loc = e.filename ? ` (${e.filename}:${e.lineno}:${e.colno})` : "";
+      log(`Host Uncaught Error: ${e.message || e}${loc}${e.error?.stack ? "\n" + e.error.stack : ""}`, "HOST_ERR");
+    }, true);
+
+    window.addEventListener("unhandledrejection", (e) => {
+      const r = e.reason;
+      log(`Host Unhandled Promise Rejection: ${r?.stack || r?.message || formatVal(r)}`, "HOST_ERR");
+    });
+
+    return { log, flush, clear, formatVal };
   })();
   //#endregion
 
@@ -174,6 +253,7 @@
   const FSUtils = (() => {
     const IGNORED = /(?:^|\/)(?:node_modules|\.git|dist|build|\.next|coverage|out|\.vscode|__pycache__|__MACOSX)\//i;
     const TEXT_EXTS = /\.(?:py|txt|csv|json|html?|xml|md|sql|[jt]sx?|mjs|cjs|qjs|css|svg)$/i;
+    const RUNNABLE_EXTS = /\.(?:py|html?|[jt]sx?|mjs|cjs|zip)$/i;
     const EXTS = ["", ".tsx", ".ts", ".jsx", ".js", ".mjs", ".cjs", ".json", ".css", "/index.tsx", "/index.ts", "/index.jsx", "/index.js"];
     const MIME = {
       png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp",
@@ -186,7 +266,18 @@
     const isHtml = (n = "") => /\.html?$/i.test(n);
     const isTsOrJs = (n = "") => /\.(?:[jt]sx?|mjs|cjs)$/i.test(n);
     const isZip = (n = "") => /\.zip$/i.test(n);
+    const isRunnable = (n = "") => RUNNABLE_EXTS.test(n);
     const toStr = (c) => (typeof c === "string" ? c : new TextDecoder().decode(c));
+
+    const detectLangLabel = (name = "") => {
+      const n = name.toLowerCase();
+      if (n.endsWith(".py")) return "Python";
+      if (n.endsWith(".ts") || n.endsWith(".tsx")) return "TypeScript";
+      if (n.endsWith(".js") || n.endsWith(".jsx") || n.endsWith(".mjs")) return "JavaScript";
+      if (n.endsWith(".html") || n.endsWith(".htm")) return "HTML";
+      if (n.endsWith(".zip")) return "Archive";
+      return "Project";
+    };
 
     const sanitizePath = (p = "") => {
       p = p.replace(/\\/g, "/").replace(/^\/+/, "");
@@ -258,7 +349,7 @@
     };
 
     return {
-      TEXT_EXTS, MIME, isPy, isHtml, isTsOrJs, isZip, toStr, sanitizePath, toB64,
+      TEXT_EXTS, MIME, isPy, isHtml, isTsOrJs, isZip, isRunnable, detectLangLabel, toStr, sanitizePath, toB64,
       toBase64, normPath, joinPath, splitQuery, getDir, resolvePath, findFile, toFileMap, isReactProj, stripRoot
     };
   })();
@@ -295,12 +386,16 @@
 
     async function bundleCode(entryPath, files, { isWorker = false } = {}) {
       if (!esbuildInit) {
-        Logger.log("Initializing esbuild-wasm...");
+        const tInit = performance.now();
+        Logger.log("Initializing esbuild-wasm (v0.28.2)...", "BUNDLE");
         esbuildInit = esbuild.initialize({ wasmURL: "https://esm.sh/esbuild-wasm@0.28.2/esbuild.wasm", worker: true })
+          .then(() => Logger.log(`esbuild-wasm initialized in ${(performance.now() - tInit).toFixed(0)}ms`, "BUNDLE"))
           .catch((e) => { esbuildInit = null; throw e; });
       }
       await esbuildInit;
       const isReact = FSUtils.isReactProj(files);
+      const resolvedExternals = new Set();
+      const loadedVfsFiles = [];
 
       const res = await esbuild.build({
         entryPoints: [entryPath], bundle: true, write: false, format: "esm", outfile: "bundle.js",
@@ -318,7 +413,10 @@
                 const t = cp.startsWith("/workspace") ? cp : FSUtils.joinPath("/workspace", cp);
                 return { path: (FSUtils.findFile(files, t)?.path ?? t) + q, namespace: "vfs" };
               }
-              if (/^(?:https?:|data:|blob:)/i.test(a.path)) return { path: a.path, external: true };
+              if (/^(?:https?:|data:|blob:)/i.test(a.path)) {
+                resolvedExternals.add(a.path);
+                return { path: a.path, external: true };
+              }
               if (/^\.\.?\//.test(cp)) {
                 const r = FSUtils.normPath(FSUtils.joinPath(a.importer ? FSUtils.getDir(a.importer) : "/workspace", cp));
                 return { path: (FSUtils.findFile(files, r)?.path ?? r) + q, namespace: "vfs" };
@@ -330,7 +428,9 @@
               const loc = FSUtils.findFile(files, FSUtils.joinPath("/workspace", cp));
               if (loc) return { path: loc.path + q, namespace: "vfs" };
               const extQ = isReact && !a.path.includes("external=") ? (a.path.includes("?") ? "&" : "?") + "external=react,react-dom" : "";
-              return { path: `https://esm.sh/${a.path}${extQ}`, external: true };
+              const cdnUrl = `https://esm.sh/${a.path}${extQ}`;
+              resolvedExternals.add(cdnUrl);
+              return { path: cdnUrl, external: true };
             });
 
             b.onLoad({ filter: /.*/, namespace: "vfs" }, async (a) => {
@@ -343,11 +443,13 @@
               const m = FSUtils.findFile(files, cleanPath);
               if (!m) return { errors: [{ text: `Module not found: ${cleanPath}` }] };
 
+              loadedVfsFiles.push(m.path.replace(/^\/workspace\//, ""));
               const ext = m.path.split(".").pop()?.toLowerCase() ?? "";
               const raw = FSUtils.toStr(m.content);
 
               if (params.has("raw")) return { contents: raw, loader: "text" };
               if (params.has("worker") || params.has("sharedworker") || (params.has("url") && FSUtils.isTsOrJs(m.path))) {
+                Logger.log(`Bundling Web Worker module: ${m.path}`, "WORKER");
                 const wCode = JSON.stringify(await bundleCode(m.path, files, { isWorker: true }));
                 return {
                   contents: params.has("url")
@@ -376,16 +478,228 @@
           }
         }]
       });
+
+      if (res.warnings?.length) {
+        for (const w of res.warnings) {
+          const loc = w.location ? `${w.location.file}:${w.location.line}:${w.location.column}: ` : "";
+          Logger.log(`esbuild warning: ${loc}${w.text}`, "WARN");
+        }
+      }
+      if (resolvedExternals.size) {
+        Logger.log(`Resolved ${resolvedExternals.size} external CDN module(s): ${[...resolvedExternals].join(", ")}`, "BUNDLE");
+      }
       const out = res.outputFiles[0].text;
+      Logger.log(
+        `Compiled ${loadedVfsFiles.length} VFS module(s) (${loadedVfsFiles.join(", ")}) -> ${(out.length / 1024).toFixed(1)} KB${isReact ? " [JSX/React enabled]" : ""}`,
+        "BUNDLE"
+      );
       return isWorker ? wrapWorkerEsm(out) : out;
     }
 
     function createSandboxHtml(codeOrHtml, isHtmlEntry = false, isReactProject = true) {
       const harness = `<script>(() => {
+        const sendLog = (level, messages) => {
+          try { parent.postMessage({ type: "SANDBOX_LOG", level, messages }, "*"); } catch {}
+        };
+        const fmt = (v, depth = 0, seen = new WeakSet()) => {
+          if (v === null) return "null";
+          if (v === undefined) return "undefined";
+          if (typeof v === "string") return depth > 0 ? JSON.stringify(v) : v;
+          if (typeof v === "number" || typeof v === "boolean" || typeof v === "symbol") return String(v);
+          if (typeof v === "bigint") return v.toString() + "n";
+          if (typeof v === "function") return "[Function: " + (v.name || "anonymous") + "]";
+          if (v instanceof Error) return v.stack || (v.name + ": " + v.message);
+          if (v instanceof Date) return v.toISOString();
+          if (v instanceof RegExp) return v.toString();
+          if (typeof Element !== "undefined" && v instanceof Element) {
+            const id = v.id ? "#" + v.id : "";
+            const cls = typeof v.className === "string" && v.className.trim() ? "." + v.className.trim().split(/\\s+/).join(".") : "";
+            return "<" + v.tagName.toLowerCase() + id + cls + ">";
+          }
+          if (v instanceof ArrayBuffer) return "ArrayBuffer(" + v.byteLength + ")";
+          if (ArrayBuffer.isView(v)) return v.constructor.name + "(" + v.byteLength + " bytes)";
+          if (typeof v === "object") {
+            if (seen.has(v)) return "[Circular]";
+            if (depth > 3) return Object.prototype.toString.call(v);
+            seen.add(v);
+            if (v instanceof Map) {
+              const entries = [...v.entries()].slice(0, 50).map(([k, val]) => fmt(k, depth + 1, seen) + " => " + fmt(val, depth + 1, seen));
+              return "Map(" + v.size + ") { " + entries.join(", ") + " }";
+            }
+            if (v instanceof Set) {
+              const vals = [...v.values()].slice(0, 50).map((val) => fmt(val, depth + 1, seen));
+              return "Set(" + v.size + ") { " + vals.join(", ") + " }";
+            }
+            if (Array.isArray(v)) {
+              const items = v.slice(0, 100).map((item) => fmt(item, depth + 1, seen));
+              return "[" + items.join(", ") + (v.length > 100 ? ", ...+" + (v.length - 100) + " more" : "") + "]";
+            }
+            try {
+              const keys = Object.keys(v);
+              const pairs = keys.slice(0, 50).map((k) => k + ": " + fmt(v[k], depth + 1, seen));
+              return "{ " + pairs.join(", ") + (keys.length > 50 ? ", ..." : "") + " }";
+            } catch {
+              return Object.prototype.toString.call(v);
+            }
+          }
+          return String(v);
+        };
+
         try { localStorage.getItem("__t"); } catch {
           const ms = () => { let s = {}; return { getItem: k => Object.hasOwn(s, k) ? s[k] : null, setItem: (k, v) => { s[k] = String(v); }, removeItem: k => { delete s[k]; }, clear: () => { s = {}; }, key: i => Object.keys(s)[i] ?? null, get length() { return Object.keys(s).length; } }; };
           try { Object.defineProperty(window, "localStorage", { value: ms(), configurable: true }); Object.defineProperty(window, "sessionStorage", { value: ms(), configurable: true }); } catch {}
         }
+
+        let groupDepth = 0;
+        const counts = new Map(), timers = new Map();
+        const pad = () => groupDepth > 0 ? "  ".repeat(groupDepth) : "";
+
+        for (const l of ["log", "info", "warn", "error", "debug"]) {
+          const o = console[l];
+          console[l] = (...a) => {
+            sendLog(l.toUpperCase(), [pad() + a.map(v => fmt(v)).join(" ")]);
+            o?.apply(console, a);
+          };
+        }
+        const origTrace = console.trace;
+        console.trace = (...a) => {
+          const stack = (new Error().stack || "").split("\\n").slice(2).join("\\n");
+          sendLog("TRACE", [pad() + (a.length ? a.map(v => fmt(v)).join(" ") + "\\n" : "console.trace()\\n") + stack]);
+          origTrace?.apply(console, a);
+        };
+        const origDir = console.dir;
+        console.dir = (obj, ...a) => {
+          sendLog("DIR", [pad() + fmt(obj)]);
+          origDir?.call(console, obj, ...a);
+        };
+        const origTable = console.table;
+        console.table = (data, cols) => {
+          sendLog("TABLE", [pad() + fmt(data)]);
+          origTable?.call(console, data, cols);
+        };
+        const origAssert = console.assert;
+        console.assert = (cond, ...a) => {
+          if (!cond) sendLog("ASSERT", [pad() + "Assertion failed: " + (a.length ? a.map(v => fmt(v)).join(" ") : "console.assert")]);
+          origAssert?.call(console, cond, ...a);
+        };
+        console.count = (label = "default") => {
+          const k = String(label), n = (counts.get(k) || 0) + 1;
+          counts.set(k, n);
+          sendLog("COUNT", [pad() + k + ": " + n]);
+        };
+        console.countReset = (label = "default") => { counts.delete(String(label)); };
+        console.time = (label = "default") => { timers.set(String(label), performance.now()); };
+        console.timeLog = (label = "default", ...a) => {
+          const k = String(label), t0 = timers.get(k);
+          if (t0 !== undefined) sendLog("TIMER", [pad() + k + ": " + (performance.now() - t0).toFixed(2) + "ms" + (a.length ? " " + a.map(v => fmt(v)).join(" ") : "")]);
+          else sendLog("WARN", [pad() + "Timer '" + k + "' does not exist"]);
+        };
+        console.timeEnd = (label = "default") => {
+          const k = String(label), t0 = timers.get(k);
+          if (t0 !== undefined) {
+            timers.delete(k);
+            sendLog("TIMER", [pad() + k + ": " + (performance.now() - t0).toFixed(2) + "ms"]);
+          } else sendLog("WARN", [pad() + "Timer '" + k + "' does not exist"]);
+        };
+        console.group = (...a) => {
+          sendLog("GROUP", [pad() + "▼ " + (a.length ? a.map(v => fmt(v)).join(" ") : "console.group")]);
+          groupDepth = Math.min(groupDepth + 1, 10);
+        };
+        console.groupCollapsed = (...a) => {
+          sendLog("GROUP", [pad() + "▶ " + (a.length ? a.map(v => fmt(v)).join(" ") : "console.groupCollapsed")]);
+          groupDepth = Math.min(groupDepth + 1, 10);
+        };
+        console.groupEnd = () => { groupDepth = Math.max(0, groupDepth - 1); };
+        const origClear = console.clear;
+        console.clear = () => { sendLog("CONSOLE", ["Console cleared by script"]); origClear?.call(console); };
+
+        window.addEventListener("error", (e) => {
+          if (e.target && e.target !== window) {
+            const el = e.target;
+            const src = el.src || el.href || "";
+            sendLog("RES_ERR", ["Failed to load <" + (el.tagName || "resource").toLowerCase() + ">: " + (src || "(inline)")]);
+            return;
+          }
+          const loc = e.filename ? " (" + e.filename.split("/").pop() + ":" + e.lineno + ":" + e.colno + ")" : "";
+          const stack = e.error?.stack ? "\\n" + e.error.stack : "";
+          sendLog("UNCAUGHT_ERR", [(e.message || String(e)) + loc + stack]);
+        }, true);
+
+        window.addEventListener("unhandledrejection", (e) => {
+          const r = e.reason;
+          sendLog("UNHANDLED_PROMISE", [r instanceof Error ? (r.stack || r.message) : fmt(r)]);
+        });
+
+        window.addEventListener("securitypolicyviolation", (e) => {
+          sendLog("CSP_ERR", ["Blocked '" + e.blockedURI + "' by directive '" + e.violatedDirective + "'"]);
+        });
+
+        if (typeof window.fetch === "function") {
+          const origFetch = window.fetch.bind(window);
+          window.fetch = async (input, init) => {
+            const method = (init?.method || (input instanceof Request ? input.method : "GET")).toUpperCase();
+            const rawUrl = typeof input === "string" ? input : (input?.url || String(input));
+            const shortUrl = rawUrl.startsWith("data:") ? rawUrl.slice(0, 48) + "..." : rawUrl;
+            const t0 = performance.now();
+            try {
+              const res = await origFetch(input, init);
+              const dt = (performance.now() - t0).toFixed(0);
+              sendLog(res.ok ? "NET" : "NET_WARN", [method + " " + shortUrl + " -> " + res.status + " " + res.statusText + " (" + dt + "ms)"]);
+              return res;
+            } catch (err) {
+              const dt = (performance.now() - t0).toFixed(0);
+              sendLog("NET_ERR", [method + " " + shortUrl + " -> FAILED (" + dt + "ms): " + (err?.message || err)]);
+              throw err;
+            }
+          };
+        }
+
+        if (typeof XMLHttpRequest !== "undefined") {
+          const origOpen = XMLHttpRequest.prototype.open;
+          const origSend = XMLHttpRequest.prototype.send;
+          XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+            this.__xhrMeta = { method: String(method || "GET").toUpperCase(), url: String(url || "") };
+            return origOpen.call(this, method, url, ...rest);
+          };
+          XMLHttpRequest.prototype.send = function(...args) {
+            const meta = this.__xhrMeta || { method: "GET", url: "(unknown)" };
+            const t0 = performance.now();
+            this.addEventListener("loadend", () => {
+              const dt = (performance.now() - t0).toFixed(0);
+              const lvl = this.status >= 200 && this.status < 400 ? "NET" : "NET_WARN";
+              sendLog(lvl, ["XHR " + meta.method + " " + meta.url + " -> " + (this.status || "ERR") + " (" + dt + "ms)"]);
+            }, { once: true });
+            return origSend.apply(this, args);
+          };
+        }
+
+        if (typeof WebSocket !== "undefined") {
+          const OrigWS = window.WebSocket;
+          window.WebSocket = function(url, protocols) {
+            sendLog("WS", ["Connecting to " + url]);
+            const ws = protocols !== undefined ? new OrigWS(url, protocols) : new OrigWS(url);
+            ws.addEventListener("open", () => sendLog("WS", ["Connected: " + url]));
+            ws.addEventListener("close", (e) => sendLog("WS", ["Closed: " + url + " (code " + e.code + ")"]));
+            ws.addEventListener("error", () => sendLog("WS_ERR", ["WebSocket error on " + url]));
+            return ws;
+          };
+          window.WebSocket.prototype = OrigWS.prototype;
+          Object.assign(window.WebSocket, OrigWS);
+        }
+
+        const OrigAC = window.AudioContext || window.webkitAudioContext;
+        if (OrigAC) {
+          const PatchedAC = function(...args) {
+            const ctx = new OrigAC(...args);
+            sendLog("AUDIO", ["AudioContext created (" + ctx.sampleRate + "Hz, state: " + ctx.state + ")"]);
+            ctx.addEventListener("statechange", () => sendLog("AUDIO", ["AudioContext state -> " + ctx.state]));
+            return ctx;
+          };
+          PatchedAC.prototype = OrigAC.prototype;
+          try { Object.setPrototypeOf(PatchedAC, OrigAC); } catch {}
+          window.AudioContext = window.webkitAudioContext = PatchedAC;
+        }
+
         window.__vfsWorkerCodeMap = new Map(); window.__vfsBlobMap = new Map(); window.__vfsWorkerModuleCache = new Map();
         const origURL = URL.createObjectURL.bind(URL);
         URL.createObjectURL = (o) => { const u = origURL(o); if (o instanceof Blob) window.__vfsBlobMap.set(u, o); return u; };
@@ -398,12 +712,14 @@
           }
           return window.__vfsWorkerModuleCache.get(w);
         };
-        window.__createVirtualWorker = (codeOrPromise) => {
+        window.__createVirtualWorker = (codeOrPromise, opts) => {
+          const wName = opts?.name || "VirtualWorker";
+          sendLog("WORKER", ["Spawning " + wName]);
           const ht = new EventTarget(), wt = new EventTarget(), mc1 = new MessageChannel(), mc2 = new MessageChannel();
           const wq = [], hq = []; let started = false, closed = false, wom = null, woe = null, hom = null, hoe = null;
           mc1.port2.onmessage = () => { if (!closed && started) while (wq.length && !closed) wt.dispatchEvent(new MessageEvent("message", { data: wq.shift() })); };
           mc2.port2.onmessage = () => { if (!closed) while (hq.length && !closed) ht.dispatchEvent(new MessageEvent("message", { data: hq.shift() })); };
-          const close = () => { closed = true; wq.length = hq.length = 0; mc1.port1.close(); mc1.port2.close(); mc2.port1.close(); mc2.port2.close(); };
+          const close = () => { if (!closed) sendLog("WORKER", ["Terminated " + wName]); closed = true; wq.length = hq.length = 0; mc1.port1.close(); mc1.port2.close(); mc2.port1.close(); mc2.port2.close(); };
           const wSelf = new Proxy(window, {
             get(t, p) {
               if (p === "self" || p === "globalThis") return wSelf;
@@ -424,7 +740,10 @@
             if (closed) return;
             if (typeof m.default === "function") await m.default(wSelf, wSelf, wSelf.postMessage, wSelf.addEventListener, wSelf.removeEventListener, close);
             if (!closed && !started) { started = true; if (wq.length) mc1.port1.postMessage(null); }
-          }).catch(e => { hoe?.(new ErrorEvent("error", { error: e, message: e?.message || String(e) })); });
+          }).catch(e => {
+            sendLog("WORKER_ERR", [wName + " error: " + (e?.stack || e?.message || String(e))]);
+            hoe?.(new ErrorEvent("error", { error: e, message: e?.message || String(e) }));
+          });
           return {
             postMessage(d) { if (!closed) { wq.push(d); if (started) mc1.port1.postMessage(null); } },
             addEventListener: ht.addEventListener.bind(ht), removeEventListener: ht.removeEventListener.bind(ht), dispatchEvent: ht.dispatchEvent.bind(ht),
@@ -436,15 +755,12 @@
         const NW = window.Worker;
         window.Worker = function(u, o) {
           const s = String(u);
-          if (window.__vfsWorkerCodeMap.has(s)) return window.__createVirtualWorker(window.__vfsWorkerCodeMap.get(s));
-          if (window.__vfsBlobMap.has(s)) return window.__createVirtualWorker(window.__vfsBlobMap.get(s).text());
+          if (window.__vfsWorkerCodeMap.has(s)) return window.__createVirtualWorker(window.__vfsWorkerCodeMap.get(s), o);
+          if (window.__vfsBlobMap.has(s)) return window.__createVirtualWorker(window.__vfsBlobMap.get(s).text(), o);
+          sendLog("WORKER", ["Spawning native Worker: " + s]);
           return new NW(u, o);
         };
         window.Worker.prototype = NW.prototype;
-        for (const l of ["log", "info", "warn", "error"]) {
-          const o = console[l];
-          console[l] = (...a) => { try { parent.postMessage({ type: "SANDBOX_LOG", level: l, messages: a.map(v => typeof v === "object" ? JSON.stringify(v) : String(v)) }, "*"); } catch {} o?.apply(console, a); };
-        }
       })();<\/script>`;
 
       const uri = (s) => "data:text/javascript," + encodeURIComponent(s);
@@ -468,13 +784,18 @@
       const safeCode = JSON.stringify(codeOrHtml || "").replace(/<\/script>/gi, "<\\/script>");
       return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">${head}</head>
 <body class="p-4 bg-zinc-950 text-zinc-100 min-h-screen"><div id="root"></div><script type="module">
+  const t0 = performance.now();
   const u = URL.createObjectURL(new Blob([${safeCode}], { type: "application/javascript" }));
   try {
     const m = await import(u);
+    parent.postMessage({ type: "SANDBOX_LOG", level: "RUNTIME", messages: ["Entry module evaluated in " + (performance.now() - t0).toFixed(1) + "ms"] }, "*");
     if (${Boolean(isReactProject)}) {
       const C = m.default || m.App || m.Main, r = document.getElementById("root");
-      if ((window.React?.isValidElement(C) || typeof C === "function" || (C && typeof C === "object" && "$$typeof" in C)) && r && !r.hasChildNodes())
+      if ((window.React?.isValidElement(C) || typeof C === "function" || (C && typeof C === "object" && "$$typeof" in C)) && r && !r.hasChildNodes()) {
+        const compName = typeof C === "function" ? (C.displayName || C.name || "Component") : "Element";
+        parent.postMessage({ type: "SANDBOX_LOG", level: "REACT", messages: ["Mounting <" + compName + " /> to #root (React " + (window.React?.version || "18") + ")"] }, "*");
         window.ReactDOM.createRoot(r).render(window.React.isValidElement(C) ? C : window.React.createElement(C));
+      }
     }
   } catch (e) { console.error(e); } finally { URL.revokeObjectURL(u); }
 <\/script></body></html>`;
@@ -483,31 +804,40 @@
     async function buildStandalone(target, projectFiles) {
       const fileMap = FSUtils.toFileMap(projectFiles), isReact = FSUtils.isReactProj(fileMap), t0 = performance.now();
       if (FSUtils.isHtml(target.name)) {
-        Logger.log(`Bundling HTML entry: ${target.name}...`);
+        Logger.log(`Bundling HTML entry: ${target.name}...`, "BUNDLE");
         const doc = new DOMParser().parseFromString(FSUtils.toStr(target.content), "text/html");
         for (const l of doc.querySelectorAll('link[rel~="stylesheet"][href]')) {
-          const res = FSUtils.resolvePath(target.name, l.getAttribute("href")), m = FSUtils.findFile(fileMap, res);
+          const href = l.getAttribute("href");
+          const res = FSUtils.resolvePath(target.name, href), m = FSUtils.findFile(fileMap, res);
           if (m) {
             const s = doc.createElement("style");
-            s.textContent = FSUtils.toStr(m.content).replace(/<\/style>/gi, "<\\/style>");
+            const cssText = FSUtils.toStr(m.content);
+            s.textContent = cssText.replace(/<\/style>/gi, "<\\/style>");
             l.replaceWith(s);
+            Logger.log(`Inlined stylesheet: ${href} (${(cssText.length / 1024).toFixed(1)} KB)`, "BUNDLE");
+          } else if (!/^(?:https?:|data:|blob:|\/\/)/i.test(href)) {
+            Logger.log(`Stylesheet not found in workspace: ${href}`, "WARN");
           }
         }
         for (const s of doc.querySelectorAll("script[src]")) {
-          const res = FSUtils.resolvePath(target.name, s.getAttribute("src")), entry = res.startsWith("/") ? res : `/workspace/${res}`;
+          const src = s.getAttribute("src");
+          const res = FSUtils.resolvePath(target.name, src), entry = res.startsWith("/") ? res : `/workspace/${res}`;
           if (FSUtils.findFile(fileMap, entry)) {
             const inl = doc.createElement("script");
             inl.type = "module";
             inl.textContent = (await bundleCode(entry, fileMap)).replace(/<\/script>/gi, "<\\/script>");
             s.replaceWith(inl);
+            Logger.log(`Bundled & inlined script: ${src}`, "BUNDLE");
+          } else if (!/^(?:https?:|data:|blob:|\/\/)/i.test(src)) {
+            Logger.log(`Script not found in workspace: ${src}`, "WARN");
           }
         }
-        Logger.log(`Bundled ${target.name} in ${(performance.now() - t0).toFixed(0)}ms`);
+        Logger.log(`Finished bundling HTML ${target.name} in ${(performance.now() - t0).toFixed(0)}ms`, "PERF");
         return createSandboxHtml("<!DOCTYPE html>\n" + doc.documentElement.outerHTML, true, isReact);
       }
-      Logger.log(`Bundling TS/JS entry: ${target.name}...`);
+      Logger.log(`Bundling TS/JS entry: ${target.name}...`, "BUNDLE");
       const js = await bundleCode(`/workspace/${target.name.replaceAll("\\", "/").replace(/^\/+/, "")}`, fileMap);
-      Logger.log(`Bundled ${target.name} in ${(performance.now() - t0).toFixed(0)}ms`);
+      Logger.log(`Finished bundling ${target.name} in ${(performance.now() - t0).toFixed(0)}ms`, "PERF");
       return createSandboxHtml(js, false, isReact);
     }
 
@@ -522,7 +852,7 @@
     const interruptView = interruptBuffer ? new Uint8Array(interruptBuffer) : null;
 
     const PYTHON_BOOT_CODE = String.raw`
-import ast, asyncio, base64, builtins, concurrent.futures as cf, io, js, micropip, os, pyodide, pyodide.code, pyodide.ffi, pyodide_js, re, shutil, sys, time, tokenize
+import ast, asyncio, base64, builtins, concurrent.futures as cf, io, js, micropip, os, pyodide, pyodide.code, pyodide.ffi, pyodide_js, re, shutil, sys, time, tokenize, traceback
 _WORKSPACE_ROOT = "/workspace"
 os.makedirs(_WORKSPACE_ROOT, exist_ok=True); os.chdir(_WORKSPACE_ROOT)
 _ORIG_SLEEP = time.sleep
@@ -541,10 +871,18 @@ _proxies = []
 _current_main_task = None
 PKG = {"PIL":"pillow","cv2":"opencv-python","sklearn":"scikit-learn","bs4":"beautifulsoup4","yaml":"pyyaml","pygame":"pygame-ce","turtle":"basthon-turtle"}
 
+def _on_task_done(t):
+    _tasks.discard(t)
+    if not _stop_requested and not t.cancelled():
+        exc = t.exception()
+        if exc is not None:
+            tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            sys.stderr.write(f"[AsyncTask Error] Unhandled exception in background task:\n{tb}\n")
+
 def _track_task(t):
     if _in_user_code and isinstance(t, asyncio.Future):
         _tasks.add(t)
-        t.add_done_callback(lambda x: _tasks.discard(x))
+        t.add_done_callback(_on_task_done)
     return t
 
 async def _patched_async_sleep(delay, result=None):
@@ -726,15 +1064,24 @@ async def _run_entry(entry_rel):
     os.chdir(entry_dir); sys.path[:] = [entry_dir, _WORKSPACE_ROOT] + [p for p in sys.path if p not in (entry_dir, _WORKSPACE_ROOT)]
     with tokenize.open(abs_entry) as fp: code = fp.read()
 
-    found = set(pyodide.code.find_imports(code))
-    if found and not _stop_requested:
-        try: await pyodide_js.loadPackagesFromImports("\n".join(f"import {m}" for m in found))
-        except: pass
-    for p in found:
+    found = sorted(set(pyodide.code.find_imports(code)))
+    missing = [p for p in found if p not in sys.modules and not os.path.exists(os.path.join(entry_dir, f"{p}.py")) and not os.path.exists(os.path.join(_WORKSPACE_ROOT, f"{p}.py"))]
+    if missing and not _stop_requested:
+        print(f"[PY-PKG] Resolving imports: {', '.join(missing)}")
+        try:
+            await pyodide_js.loadPackagesFromImports("\n".join(f"import {m}" for m in missing))
+        except Exception as e:
+            print(f"[PY-PKG] Pyodide loadPackagesFromImports note: {e}")
+    for p in missing:
         if _stop_requested: break
         if not sys.modules.get(p):
-            try: await micropip.install(PKG.get(p, p))
-            except: pass
+            pkg_name = PKG.get(p, p)
+            try:
+                print(f"[PY-PKG] Installing '{pkg_name}' via micropip...")
+                await micropip.install(pkg_name)
+                print(f"[PY-PKG] Installed '{pkg_name}' successfully.")
+            except Exception as e:
+                sys.stderr.write(f"[PY-PKG] Failed to install '{pkg_name}': {e}\n")
 
     if _stop_requested:
         return None
@@ -777,7 +1124,11 @@ async def _run_entry(entry_rel):
         return res
     except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
         if not _stop_requested:
+            sys.stderr.write(traceback.format_exc())
             raise
+    except Exception:
+        sys.stderr.write(traceback.format_exc())
+        raise
     finally:
         if _current_main_task is asyncio.current_task():
             _current_main_task = None
@@ -796,6 +1147,30 @@ window.c = canvas;
 let py=null, pyP=null, bootCode="", intBuf=null, onLog=null, onErr=null;
 let stopped=false, tracking=false, currentEpoch=0;
 
+const sendHostLog = (level, msg) => {
+  try { parent.postMessage({ type: "SANDBOX_LOG", level, messages: [String(msg)] }, "*"); } catch {}
+};
+
+for (const l of ["log", "info", "warn", "error", "debug"]) {
+  const orig = console[l];
+  console[l] = (...a) => {
+    if (tracking) sendHostLog("PY_" + l.toUpperCase(), a.map(v => typeof v === "object" ? JSON.stringify(v) : String(v)).join(" "));
+    orig?.apply(console, a);
+  };
+}
+
+window.addEventListener("error", (e) => {
+  if (!tracking) return;
+  const loc = e.filename ? " (" + e.filename.split("/").pop() + ":" + e.lineno + ")" : "";
+  sendHostLog("PY_DOM_ERR", (e.message || String(e)) + loc);
+}, true);
+
+window.addEventListener("unhandledrejection", (e) => {
+  if (!tracking) return;
+  const r = e.reason;
+  sendHostLog("PY_PROMISE_ERR", r?.stack || r?.message || String(r));
+});
+
 const origST = window.setTimeout.bind(window), origCT = window.clearTimeout.bind(window);
 const origSI = window.setInterval.bind(window), origCI = window.clearInterval.bind(window);
 const origRAF = window.requestAnimationFrame.bind(window), origCAF = window.cancelAnimationFrame.bind(window);
@@ -808,6 +1183,8 @@ if (OrigAudioContext) {
   const PatchedAC = function(...args) {
     const ctx = new OrigAudioContext(...args);
     audioContexts.add(ctx);
+    sendHostLog("AUDIO", "Python WebAudio context created (" + ctx.sampleRate + "Hz, state: " + ctx.state + ")");
+    ctx.addEventListener("statechange", () => sendHostLog("AUDIO", "Python WebAudio state -> " + ctx.state));
     return ctx;
   };
   PatchedAC.prototype = OrigAudioContext.prototype;
@@ -994,7 +1371,9 @@ const log = (t, err=false) => { o.append(t + "\\n"); o.scrollTop = o.scrollHeigh
 async function ensurePy() {
   if (pyP) return pyP;
   return pyP = (async () => {
+    const t0 = performance.now();
     o.textContent = "Loading Pyodide WebAssembly...";
+    sendHostLog("PYODIDE", "Downloading & initializing Pyodide v0.27.2 WebAssembly runtime...");
     const { loadPyodide } = await import("https://cdn.jsdelivr.net/pyodide/v0.27.2/full/pyodide.mjs");
     py = await loadPyodide({ stdout: s => log(s), stderr: s => log(s, true) });
     py._module.canvas = canvas;
@@ -1003,6 +1382,7 @@ async function ensurePy() {
     if (intBuf) try { py.setInterruptBuffer(intBuf); } catch {}
     await py.loadPackage(["micropip"]);
     if (bootCode) py.runPython(bootCode);
+    sendHostLog("PYODIDE", "Pyodide v0.27.2 + micropip ready in " + (performance.now() - t0).toFixed(0) + "ms");
     return py;
   })();
 }
@@ -1013,11 +1393,15 @@ Comlink.expose({
     stopped = true; tracking = false;
     try { p.runPython("_reset_workspace()"); } catch {}
     cleanupRuntime();
+    let totalBytes = 0;
     for (const { name, content } of files) {
       const full = W + "/" + name, d = full.slice(0, full.lastIndexOf("/"));
       if (d) try { p.FS.mkdirTree(d); } catch {}
-      p.FS.writeFile(full, typeof content === "string" ? new TextEncoder().encode(content) : content);
+      const u8 = typeof content === "string" ? new TextEncoder().encode(content) : content;
+      totalBytes += u8.byteLength || 0;
+      p.FS.writeFile(full, u8);
     }
+    sendHostLog("VFS", "Synced " + files.length + " file(s) (" + (totalBytes / 1024).toFixed(1) + " KB) to /workspace");
   },
   async runFile(entry) {
     if (intBuf) intBuf[0] = 0;
@@ -1057,9 +1441,15 @@ Comlink.expose({
         try {
           await new Promise((res, rej) => { f.onload = res; f.onerror = rej; f.srcdoc = IFRAME_HTML; });
           pyApi = Comlink.wrap(Comlink.windowEndpoint(f.contentWindow));
-          await pyApi.configure(PYTHON_BOOT_CODE, Comlink.proxy(Logger.log), Comlink.proxy((m) => Logger.log(`[ERR] ${m}`)), interruptBuffer);
+          await pyApi.configure(
+            PYTHON_BOOT_CODE,
+            Comlink.proxy((m) => Logger.log(m, "PY_OUT")),
+            Comlink.proxy((m) => Logger.log(m, "PY_ERR")),
+            interruptBuffer
+          );
+          Logger.log(`Python worker iframe configured (SharedArrayBuffer interrupt: ${interruptBuffer ? "enabled" : "unavailable"})`, "PYODIDE");
         } catch (err) {
-          Logger.log(`[ERR] Failed initializing Python runner: ${err.message || err}`);
+          Logger.log(`Failed initializing Python runner: ${err.message || err}`, "PY_ERR");
         } finally {
           onBusy?.(false);
         }
@@ -1109,10 +1499,65 @@ init();
   })();
   //#endregion
 
-  //#region 7: ArchiveAndUploadManager
+  //#region 7: ArchiveAndBuiltinProjectsManager
   const Archive = (() => {
-    async function extractZipEntries(zipFile) {
-      const u8 = new Uint8Array(await zipFile.arrayBuffer());
+    const encodeDataUrl = (mime, code, filename) =>
+      `data:${mime};charset=utf-8,${encodeURIComponent(code)}#${encodeURIComponent(filename)}`;
+
+    const DEFAULT_BUILTIN_URLS = [
+      {
+        name: "HTML Neon Physics & Synth",
+        lang: "HTML",
+        entry: "index.html",
+        // url: encodeDataUrl("text/html", `<!---->`, "index.html")
+        url: "./examples/html/chimes/index.js"
+      },
+      {
+        name: "JavaScript Neon Physics & Synth",
+        lang: "JavaScript",
+        entry: "main.js",
+        // url: encodeDataUrl("text/javascript", `;`, "main.js")
+        url: "./examples/javascript/chimes/main.js"
+      },
+      {
+        name: "TypeScript Neon Physics & Synth",
+        lang: "TypeScript",
+        entry: "main.ts",
+        // url: encodeDataUrl("text/typescript", `;`, "main.ts")
+        url: "./examples/typescript/chimes/main.ts"
+      },
+      {
+        name: "Python Neon Physics & Synth",
+        lang: "Python",
+        entry: "main.py",
+        // url: encodeDataUrl("text/x-python", `pass`, "main.py")
+        url: "./examples/typescript/chimes/main.py"
+      }
+    ];
+
+    function getBuiltinConfig() {
+      const ext = window.BUILTIN_PROJECTS || document.builtinProjects;
+      const folders = ["./projects", "./examples", "./builtin"];
+      const urls = [];
+      if (typeof ext === "string") {
+        folders.unshift(ext);
+      } else if (Array.isArray(ext)) {
+        urls.push(...ext);
+      } else if (ext && typeof ext === "object") {
+        if (typeof ext.folder === "string") folders.unshift(ext.folder);
+        if (Array.isArray(ext.folders)) folders.unshift(...ext.folders);
+        if (Array.isArray(ext.urls)) urls.push(...ext.urls);
+      }
+      if (Array.isArray(window.BUILTIN_URLS)) urls.push(...window.BUILTIN_URLS);
+      if (typeof window.BUILTIN_FOLDER === "string") folders.unshift(window.BUILTIN_FOLDER);
+      urls.push(...DEFAULT_BUILTIN_URLS);
+      return { folders: [...new Set(folders)], urls };
+    }
+
+    async function extractZipEntries(zipBytesOrFile) {
+      const u8 = zipBytesOrFile instanceof Uint8Array
+        ? zipBytesOrFile
+        : new Uint8Array(await zipBytesOrFile.arrayBuffer());
       const data = await new Promise((res, rej) => fflate.unzip(u8, (e, d) => (e ? rej(e) : res(d))));
       const rawEntries = Object.entries(data)
         .filter(([k]) => !k.endsWith("/"))
@@ -1145,22 +1590,286 @@ init();
       return Array.from(fileMap, ([name, content]) => ({ name, content }));
     }
 
-    return { parseUploadedFiles };
+    function inferFileNameFromUrl(url, fallback = "main.js") {
+      if (url.startsWith("data:")) {
+        const hashIdx = url.indexOf("#");
+        return hashIdx > -1 ? decodeURIComponent(url.slice(hashIdx + 1)) : fallback;
+      }
+      try {
+        const u = new URL(url, window.location.href);
+        const seg = decodeURIComponent(u.pathname.split("/").filter(Boolean).pop() || "");
+        return seg || fallback;
+      } catch {
+        return url.split(/[?#]/)[0].split("/").filter(Boolean).pop() || fallback;
+      }
+    }
+
+    async function fetchRawUrl(url, asText = true) {
+      if (url.startsWith("data:")) {
+        const withoutHash = url.split("#")[0];
+        const commaIdx = withoutHash.indexOf(",");
+        const meta = withoutHash.slice(0, commaIdx);
+        const body = withoutHash.slice(commaIdx + 1);
+        if (meta.includes(";base64")) {
+          const bin = atob(body);
+          const u8 = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+          return asText ? new TextDecoder().decode(u8) : u8;
+        }
+        const text = decodeURIComponent(body);
+        return asText ? text : new TextEncoder().encode(text);
+      }
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${url}`);
+      return asText ? await res.text() : new Uint8Array(await res.arrayBuffer());
+    }
+
+    function normalizeDescriptor(item, baseUrl = "") {
+      const resolveUrl = (u) => {
+        if (!u || u.startsWith("data:") || /^(?:https?:|blob:)/i.test(u)) return u;
+        if (!baseUrl) return u;
+        return `${baseUrl.replace(/\/+$/, "")}/${u.replace(/^\.?\//, "")}`;
+      };
+
+      if (typeof item === "string") {
+        const resolved = resolveUrl(item);
+        const fileName = inferFileNameFromUrl(resolved);
+        if (!FSUtils.isRunnable(fileName)) return null;
+        const lang = FSUtils.detectLangLabel(fileName);
+        return {
+          id: `url:${resolved}`,
+          name: fileName,
+          lang,
+          entry: FSUtils.isZip(fileName) ? "" : fileName,
+          url: resolved
+        };
+      }
+
+      if (item && typeof item === "object") {
+        const url = item.url ? resolveUrl(item.url) : "";
+        const urls = Array.isArray(item.urls) ? item.urls.map(resolveUrl) : null;
+        const files = Array.isArray(item.files) ? item.files : null;
+        const entry = item.entry || (url ? inferFileNameFromUrl(url) : urls?.[0] ? inferFileNameFromUrl(urls[0]) : "");
+        const lang = item.lang || FSUtils.detectLangLabel(entry || url || item.name || "");
+        const name = item.name || entry || "Project";
+        return {
+          id: item.id || `proj:${name}:${url || (urls ? urls.join(",") : "inline")}`,
+          name,
+          lang,
+          entry,
+          url,
+          urls,
+          files,
+          baseUrl: item.folder ? resolveUrl(item.folder) : baseUrl
+        };
+      }
+      return null;
+    }
+
+    async function scanFolderListing(folderUrl) {
+      const cleanFolder = folderUrl.replace(/\/+$/, "");
+      for (const manifestName of ["manifest.json", "index.json", "projects.json"]) {
+        try {
+          const res = await fetch(`${cleanFolder}/${manifestName}`);
+          if (res.ok && (res.headers.get("content-type") || "").includes("json")) {
+            const data = await res.json();
+            const list = Array.isArray(data)
+              ? data
+              : Array.isArray(data?.projects)
+                ? data.projects
+                : Array.isArray(data?.files)
+                  ? data.files
+                  : Object.entries(data || {}).map(([name, val]) => (typeof val === "string" ? { name, url: val } : { name, ...val }));
+            const mapped = list.map((item) => normalizeDescriptor(item, cleanFolder)).filter(Boolean);
+            if (mapped.length) return mapped;
+          }
+        } catch {}
+      }
+
+      try {
+        const res = await fetch(`${cleanFolder}/`);
+        if (!res.ok) return [];
+        const ct = res.headers.get("content-type") || "";
+        if (!ct.includes("text/html")) return [];
+        const html = await res.text();
+        const doc = new DOMParser().parseFromString(html, "text/html");
+        const baseResolved = new URL(`${cleanFolder}/`, window.location.href);
+        const found = [];
+
+        for (const a of doc.querySelectorAll("a[href]")) {
+          const rawHref = a.getAttribute("href") || "";
+          if (!rawHref || rawHref.startsWith("?") || rawHref.startsWith("#") || rawHref === "../" || rawHref === "./") continue;
+          const resolved = new URL(rawHref, baseResolved);
+          if (!resolved.href.startsWith(baseResolved.href) || resolved.href === baseResolved.href) continue;
+          const rel = decodeURIComponent(resolved.href.slice(baseResolved.href.length));
+          if (rel.endsWith("/")) {
+            const subName = rel.replace(/\/+$/, "");
+            if (!subName || subName.startsWith(".")) continue;
+            const subUrl = `${cleanFolder}/${subName}`;
+            const subRes = await fetch(`${subUrl}/`).catch(() => null);
+            if (subRes?.ok && (subRes.headers.get("content-type") || "").includes("text/html")) {
+              const subDoc = new DOMParser().parseFromString(await subRes.text(), "text/html");
+              const subBase = new URL(`${subUrl}/`, window.location.href);
+              const subFiles = [];
+              for (const sa of subDoc.querySelectorAll("a[href]")) {
+                const sh = sa.getAttribute("href") || "";
+                if (!sh || sh.startsWith("?") || sh.startsWith("#") || sh.endsWith("/")) continue;
+                const sr = new URL(sh, subBase);
+                if (sr.href.startsWith(subBase.href)) subFiles.push(sr.href);
+              }
+              if (subFiles.length) {
+                found.push(normalizeDescriptor({ name: subName, urls: subFiles }, subUrl));
+              }
+            }
+          } else if (FSUtils.isRunnable(rel)) {
+            found.push(normalizeDescriptor({ name: rel, url: resolved.href }));
+          }
+        }
+        return found.filter(Boolean);
+      } catch {
+        return [];
+      }
+    }
+
+    async function discoverBuiltins() {
+      const { folders, urls } = getBuiltinConfig();
+      const folderResults = (await Promise.all(folders.map(scanFolderListing))).flat();
+      const urlResults = urls.map((u) => normalizeDescriptor(u)).filter(Boolean);
+      const seen = new Set();
+      return [...folderResults, ...urlResults].filter((item) => {
+        if (!item || seen.has(item.id)) return false;
+        seen.add(item.id);
+        return true;
+      });
+    }
+
+    async function loadProjectFiles(project) {
+      if (Array.isArray(project.files) && project.files.length && project.files[0].content !== undefined) {
+        return project.files.map((f) => ({
+          name: FSUtils.sanitizePath(f.name),
+          content: f.content
+        })).filter((f) => f.name);
+      }
+
+      if (project.url && FSUtils.isZip(inferFileNameFromUrl(project.url))) {
+        const u8 = await fetchRawUrl(project.url, false);
+        return extractZipEntries(u8);
+      }
+
+      const targetUrls = Array.isArray(project.urls) && project.urls.length
+        ? project.urls
+        : project.url
+          ? [project.url]
+          : [];
+
+      const fetched = await Promise.all(
+        targetUrls.map(async (u) => {
+          const fileName = FSUtils.sanitizePath(inferFileNameFromUrl(u, project.entry || "main.js"));
+          const isText = FSUtils.TEXT_EXTS.test(fileName);
+          const content = await fetchRawUrl(u, isText);
+          return { name: fileName, content };
+        })
+      );
+
+      if (fetched.length === 1 && FSUtils.isHtml(fetched[0].name) && !project.url?.startsWith("data:")) {
+        const htmlContent = FSUtils.toStr(fetched[0].content);
+        const doc = new DOMParser().parseFromString(htmlContent, "text/html");
+        const base = new URL(targetUrls[0], window.location.href);
+        const linked = [];
+        for (const el of doc.querySelectorAll("script[src], link[rel~='stylesheet'][href]")) {
+          const ref = el.getAttribute("src") || el.getAttribute("href");
+          if (!ref || /^(?:https?:|data:|blob:|\/\/)/i.test(ref)) continue;
+          const relName = FSUtils.sanitizePath(ref);
+          if (relName) linked.push({ relName, url: new URL(ref, base).href });
+        }
+        const extras = await Promise.all(
+          linked.map(async ({ relName, url }) => {
+            try {
+              const content = await fetchRawUrl(url, FSUtils.TEXT_EXTS.test(relName));
+              return { name: relName, content };
+            } catch {
+              return null;
+            }
+          })
+        );
+        fetched.push(...extras.filter(Boolean));
+      }
+
+      return fetched.filter((f) => f.name);
+    }
+
+    return { parseUploadedFiles, discoverBuiltins, loadProjectFiles };
   })();
   //#endregion
 
   //#region 8: UIControllerAndAppBootstrap
   (() => {
-    let projectFiles = [], isRunning = false, pyExecuting = false, activeRuntime = null, busy = false;
+    let projectFiles = [], builtinProjects = [], activeBuiltinId = "";
+    let isRunning = false, pyExecuting = false, activeRuntime = null, busy = false;
     let currentRunId = 0, activePyRunPromise = null;
+
+    const getByteSize = (c) => (typeof c === "string" ? new TextEncoder().encode(c).byteLength : (c?.byteLength || 0));
+
+    const findDefaultEntry = (files, preferred = "") => {
+      if (preferred && files.some((f) => f.name === preferred)) return preferred;
+      const cands = ["index.html", "main.py", "index.tsx", "app.tsx", "main.tsx", "app.py", "index.py", "run.py", "index.ts", "main.ts", "index.js", "main.js"];
+      for (const c of cands) {
+        const f = files.find((x) => x.name.split("/").at(-1)?.toLowerCase() === c);
+        if (f) return f.name;
+      }
+      return (files.find((f) => FSUtils.isPy(f.name) || FSUtils.isTsOrJs(f.name) || FSUtils.isHtml(f.name)) ?? files[0])?.name || "";
+    };
+
+    const getSelectedEntryName = () => {
+      const val = DOM.entrySelect.value || "";
+      if (val.startsWith("file:")) return val.slice(5);
+      return findDefaultEntry(projectFiles);
+    };
+
+    const syncUnifiedSelectors = (selectedEntry = "") => {
+      const groups = [];
+      if (projectFiles.length) {
+        const opts = projectFiles
+          .map((f) => `<option value="file:${f.name}">[${FSUtils.detectLangLabel(f.name)}] ${f.name}</option>`)
+          .join("");
+        groups.push(`<optgroup label="📂 Current Project Files">${opts}</optgroup>`);
+      }
+      if (builtinProjects.length) {
+        const opts = builtinProjects
+          .map((p) => `<option value="builtin:${p.id}">[${p.lang}] ${p.name}</option>`)
+          .join("");
+        groups.push(`<optgroup label="📦 Built-in Projects (Folder & URLs)">${opts}</optgroup>`);
+      }
+
+      const combinedHtml = groups.join("") || "<option value=''>No projects available</option>";
+      DOM.entrySelect.innerHTML = combinedHtml;
+      DOM.builtinSelect.innerHTML = combinedHtml;
+
+      const targetVal = selectedEntry && projectFiles.some((f) => f.name === selectedEntry)
+        ? `file:${selectedEntry}`
+        : activeBuiltinId
+          ? `builtin:${activeBuiltinId}`
+          : projectFiles.length
+            ? `file:${findDefaultEntry(projectFiles)}`
+            : builtinProjects.length
+              ? `builtin:${builtinProjects[0].id}`
+              : "";
+
+      if (targetVal) {
+        DOM.entrySelect.value = targetVal;
+        DOM.builtinSelect.value = targetVal;
+      }
+    };
 
     const updateUI = (isBusy = busy) => {
       busy = isBusy;
-      const has = projectFiles.length > 0;
+      const hasAny = projectFiles.length > 0 || builtinProjects.length > 0;
       DOM.fileInput.disabled = DOM.folderInput.disabled = false;
-      DOM.entrySelect.disabled = busy || !has;
-      DOM.runBtn.disabled = busy || !has;
-      DOM.downloadBtn.disabled = busy || !has;
+      DOM.builtinSelect.disabled = busy || !hasAny;
+      DOM.loadBuiltinBtn.disabled = busy || !hasAny;
+      DOM.refreshBuiltinBtn.disabled = busy;
+      DOM.entrySelect.disabled = busy || !hasAny;
+      DOM.runBtn.disabled = busy || !hasAny;
+      DOM.downloadBtn.disabled = busy || projectFiles.length === 0;
       DOM.stopBtn.disabled = !isRunning;
     };
 
@@ -1177,25 +1886,19 @@ init();
       DOM.mainDashboard.classList.remove("hidden");
     };
 
-    const findDefaultEntry = (files) => {
-      const cands = ["index.html", "main.py", "index.tsx", "app.tsx", "main.tsx", "app.py", "index.py", "run.py", "index.ts", "main.ts", "index.js", "main.js"];
-      for (const c of cands) {
-        const f = files.find((x) => x.name.split("/").at(-1)?.toLowerCase() === c);
-        if (f) return f.name;
-      }
-      return (files.find((f) => FSUtils.isPy(f.name) || FSUtils.isTsOrJs(f.name) || FSUtils.isHtml(f.name)) ?? files[0])?.name || "";
-    };
-
     async function stopExecution(silent = false) {
       currentRunId++;
       const wasRunning = isRunning || pyExecuting || activeRuntime !== null;
+      const prevRuntime = activeRuntime;
 
       DOM.resetSandbox();
 
       if (PythonRuntime.interruptView) PythonRuntime.interruptView[0] = 2;
       try { await PythonRuntime.pyApi?.stop(); } catch {}
 
-      if (!silent && wasRunning) Logger.log("Execution stopped.");
+      if (!silent && wasRunning) {
+        Logger.log(`Execution stopped (runtime: ${prevRuntime === "py" ? "Python/Pyodide" : "TypeScript/JS Sandbox"}).`, "RUNTIME");
+      }
 
       if (pyExecuting && activePyRunPromise) {
         const stoppedCleanly = await Promise.race([
@@ -1203,7 +1906,7 @@ init();
           new Promise((res) => setTimeout(() => res(false), 300))
         ]);
         if (!stoppedCleanly) {
-          Logger.log("[WARN] Resetting unresponsive runner...");
+          Logger.log("Python runner did not yield within 300ms; hard-resetting Pyodide iframe...", "WARN");
           try { await PythonRuntime.initIframeRuntime(updateUI); } catch {}
         }
       }
@@ -1220,41 +1923,49 @@ init();
       updateUI(true);
       try {
         if (FSUtils.isPy(target.name)) {
-          Logger.log(`Exporting standalone HTML for ${target.name}...`);
+          Logger.log(`Exporting standalone Python HTML for ${target.name}...`, "EXPORT");
           const html = PythonRuntime.generateStandaloneHtml(target.name, await PythonRuntime.prepareFilesForStandalone(projectFiles));
+          const fileName = `${target.name.split("/").pop().replace(/\.[^.]+$/, "") || "py_app"}.standalone.html`;
           const a = Object.assign(document.createElement("a"), {
             href: URL.createObjectURL(new Blob([html], { type: "text/html" })),
-            download: `${target.name.split("/").pop().replace(/\.[^.]+$/, "") || "py_app"}.standalone.html`
+            download: fileName
           });
           a.click();
           setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-          Logger.log("Exported standalone Python file successfully!");
+          Logger.log(`Exported ${fileName} (${(html.length / 1024).toFixed(1)} KB)`, "EXPORT");
         } else {
+          Logger.log(`Exporting standalone JS/TS HTML bundle for ${target.name}...`, "EXPORT");
           const html = await Bundler.buildStandalone(target, projectFiles);
+          const fileName = `${target.name.split("/").pop().replace(/\.[^.]+$/, "") || "bundle"}.standalone.html`;
           const a = Object.assign(document.createElement("a"), {
             href: URL.createObjectURL(new Blob([html], { type: "text/html" })),
-            download: `${target.name.split("/").pop().replace(/\.[^.]+$/, "") || "bundle"}.standalone.html`
+            download: fileName
           });
           a.click();
           setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-          Logger.log(`Exported standalone bundle for ${target.name}`);
+          Logger.log(`Exported ${fileName} (${(html.length / 1024).toFixed(1)} KB)`, "EXPORT");
         }
       } catch (e) {
-        Logger.log(`Export Error: ${e.message || e}`);
+        Logger.log(`Export Error: ${e?.stack || e?.message || e}`, "ERR");
         DOM.logsDrawer.classList.remove("translate-y-full");
       } finally {
         updateUI(false);
       }
     }
 
-    async function execEntry(download = false) {
-      const target = projectFiles.find((f) => f.name === DOM.entrySelect.value);
+    async function execEntry(download = false, explicitEntryName = "") {
+      const entryName = explicitEntryName || getSelectedEntryName();
+      const target = projectFiles.find((f) => f.name === entryName) || projectFiles[0];
       if (!target) return;
       if (download) return exportEntry(target);
 
       await stopExecution(true);
       const runId = ++currentRunId;
+      syncUnifiedSelectors(target.name);
       expandViewport();
+
+      const langLabel = FSUtils.detectLangLabel(target.name);
+      const sizeKb = (getByteSize(target.content) / 1024).toFixed(2);
 
       if (FSUtils.isPy(target.name)) {
         if (PythonRuntime.interruptView) PythonRuntime.interruptView[0] = 0;
@@ -1270,16 +1981,16 @@ init();
           try {
             await PythonRuntime.iframeReadyPromise;
             if (runId !== currentRunId) return;
-            Logger.log(`Running ${target.name}...`);
+            Logger.log(`Starting [${langLabel}] ${target.name} (${sizeKb} KB, ${projectFiles.length} workspace file(s))...`, "RUNTIME");
             const t0 = performance.now();
             await PythonRuntime.pyApi.sync(projectFiles.map((f) => ({ name: f.name, content: f.content })));
             if (runId !== currentRunId) return;
             await PythonRuntime.pyApi.runFile(target.name);
             if (runId !== currentRunId) return;
-            Logger.log(`Execution completed in ${(performance.now() - t0).toFixed(0)}ms`);
+            Logger.log(`Python script ${target.name} finished in ${(performance.now() - t0).toFixed(0)}ms`, "PERF");
           } catch (err) {
             if (runId !== currentRunId) return;
-            Logger.log(`Error: ${err?.message || err}`);
+            Logger.log(`Python Runtime Error: ${err?.stack || err?.message || err}`, "PY_ERR");
             DOM.logsDrawer.classList.remove("translate-y-full");
             isRunning = false;
             activeRuntime = null;
@@ -1300,20 +2011,63 @@ init();
         activeRuntime = "js";
         updateUI(true);
         try {
+          Logger.log(`Starting [${langLabel}] ${target.name} (${sizeKb} KB, ${projectFiles.length} workspace file(s))...`, "RUNTIME");
           const html = await Bundler.buildStandalone(target, projectFiles);
           if (runId !== currentRunId) return;
           DOM.canvasContainer.classList.add("hidden");
           const sandbox = DOM.resetSandbox();
           sandbox.classList.remove("hidden");
           sandbox.srcdoc = html;
+          Logger.log(`Mounted sandbox iframe (${(html.length / 1024).toFixed(1)} KB srcdoc)`, "RUNTIME");
         } catch (e) {
           if (runId !== currentRunId) return;
-          Logger.log(`Build Error: ${e.message || e}`);
+          Logger.log(`Build Error: ${e?.stack || e?.message || e}`, "ERR");
           DOM.logsDrawer.classList.remove("translate-y-full");
           isRunning = false;
           activeRuntime = null;
         } finally {
           if (runId === currentRunId) updateUI(false);
+        }
+      }
+    }
+
+    async function handleSelectionActivation(rawVal) {
+      if (!rawVal) return;
+      if (rawVal.startsWith("file:")) {
+        const fileName = rawVal.slice(5);
+        await execEntry(false, fileName);
+        return;
+      }
+      if (rawVal.startsWith("builtin:")) {
+        const id = rawVal.slice(8);
+        const proj = builtinProjects.find((p) => p.id === id);
+        if (!proj) return;
+        await stopExecution(true);
+        const loadId = ++currentRunId;
+        Logger.clear();
+        Logger.log(`Loading built-in project: [${proj.lang}] ${proj.name}...`, "PROJECT");
+        updateUI(true);
+        try {
+          const t0 = performance.now();
+          const files = await Archive.loadProjectFiles(proj);
+          if (loadId !== currentRunId) return;
+          if (!files.length) throw new Error("No runnable files found in project.");
+          projectFiles = files;
+          activeBuiltinId = proj.id;
+          const totalBytes = projectFiles.reduce((acc, f) => acc + getByteSize(f.content), 0);
+          Logger.log(
+            `Loaded ${projectFiles.length} file(s) (${(totalBytes / 1024).toFixed(2)} KB) in ${(performance.now() - t0).toFixed(0)}ms: ${projectFiles.map((f) => f.name).join(", ")}`,
+            "PROJECT"
+          );
+          const entry = findDefaultEntry(projectFiles, proj.entry);
+          syncUnifiedSelectors(entry);
+          updateUI(false);
+          await execEntry(false, entry);
+        } catch (e) {
+          if (loadId !== currentRunId) return;
+          Logger.log(`Load error: ${e?.stack || e?.message || e}`, "ERR");
+          DOM.logsDrawer.classList.remove("translate-y-full");
+          updateUI(false);
         }
       }
     }
@@ -1324,25 +2078,48 @@ init();
       await stopExecution(true);
       const uploadId = ++currentRunId;
       Logger.clear();
-      Logger.log("Loading files...");
+      Logger.log(`Processing ${rawFiles.length} uploaded item(s)...`, "UPLOAD");
       updateUI(true);
       try {
+        const t0 = performance.now();
         const parsed = await Archive.parseUploadedFiles(rawFiles);
         if (uploadId !== currentRunId) return;
         projectFiles = parsed;
+        activeBuiltinId = "";
         if (!projectFiles.length) {
-          DOM.entrySelect.innerHTML = "<option>No valid files found</option>";
+          syncUnifiedSelectors();
           return updateUI(false);
         }
-        DOM.entrySelect.innerHTML = projectFiles.map((f) => `<option>${f.name}</option>`).join("");
-        DOM.entrySelect.value = findDefaultEntry(projectFiles);
+        const totalBytes = projectFiles.reduce((acc, f) => acc + getByteSize(f.content), 0);
+        const defaultEntry = findDefaultEntry(projectFiles);
+        syncUnifiedSelectors(defaultEntry);
         updateUI(false);
-        Logger.log(`Loaded ${projectFiles.length} file(s).`);
-        await execEntry(false);
+        Logger.log(
+          `Extracted ${projectFiles.length} workspace file(s) (${(totalBytes / 1024).toFixed(1)} KB) in ${(performance.now() - t0).toFixed(0)}ms: ${projectFiles.map((f) => f.name).join(", ")}`,
+          "UPLOAD"
+        );
+        await execEntry(false, defaultEntry);
       } catch (e) {
         if (uploadId !== currentRunId) return;
-        Logger.log(`Upload error: ${e.message || e}`);
+        Logger.log(`Upload error: ${e?.stack || e?.message || e}`, "ERR");
         DOM.logsDrawer.classList.remove("translate-y-full");
+        updateUI(false);
+      }
+    }
+
+    async function refreshBuiltinList() {
+      updateUI(true);
+      try {
+        const t0 = performance.now();
+        builtinProjects = await Archive.discoverBuiltins();
+        syncUnifiedSelectors(projectFiles.length ? getSelectedEntryName() : "");
+        Logger.log(
+          `Discovered ${builtinProjects.length} built-in project(s) in ${(performance.now() - t0).toFixed(0)}ms: ${builtinProjects.map((p) => `[${p.lang}] ${p.name}`).join(", ")}`,
+          "SYS"
+        );
+      } catch (e) {
+        Logger.log(`Failed scanning built-in projects: ${e.message || e}`, "ERR");
+      } finally {
         updateUI(false);
       }
     }
@@ -1354,7 +2131,9 @@ init();
       else await document.exitFullscreen?.();
     };
     document.addEventListener("fullscreenchange", () => {
-      DOM.fullscreenBtn.textContent = document.fullscreenElement ? "⤓ Exit Fullscreen" : "⛶ Fullscreen";
+      const isFs = Boolean(document.fullscreenElement);
+      DOM.fullscreenBtn.textContent = isFs ? "⤓ Exit Fullscreen" : "⛶ Fullscreen";
+      Logger.log(`Viewport fullscreen ${isFs ? "enabled" : "exited"}`, "UI");
     });
 
     DOM.toggleLogsBtn.onclick = () => DOM.logsDrawer.classList.toggle("translate-y-full");
@@ -1367,12 +2146,21 @@ init();
       await handleUpload(files);
     };
 
-    DOM.entrySelect.onchange = () => execEntry(false);
-    DOM.runBtn.onclick = () => execEntry(false);
+    DOM.builtinSelect.onchange = () => handleSelectionActivation(DOM.builtinSelect.value);
+    DOM.loadBuiltinBtn.onclick = () => handleSelectionActivation(DOM.builtinSelect.value);
+    DOM.refreshBuiltinBtn.onclick = () => refreshBuiltinList();
+
+    DOM.entrySelect.onchange = () => handleSelectionActivation(DOM.entrySelect.value);
+    DOM.runBtn.onclick = () => handleSelectionActivation(DOM.entrySelect.value);
     DOM.stopBtn.onclick = () => stopExecution(false);
     DOM.downloadBtn.onclick = () => execEntry(true);
 
+    Logger.log(
+      `Host environment ready (crossOriginIsolated=${Boolean(window.crossOriginIsolated)}, SharedArrayBuffer=${typeof SharedArrayBuffer !== "undefined"}, cores=${navigator.hardwareConcurrency || "n/a"})`,
+      "ENV"
+    );
     PythonRuntime.initIframeRuntime().catch(() => {});
+    refreshBuiltinList();
   })();
   //#endregion
 })();
