@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>HTML Neon Physics &amp; Synth</title>
+  <style>
+    html, body {
+      margin: 0;
+      background: #000;
+      color: #fff;
+      overflow: hidden;
+      width: 100vw;
+      height: 100vh;
+    }
+    #canvas {
+      position: fixed;
+      inset: 0;
+      width: 100vw;
+      height: 100vh;
+      object-fit: contain;
+      outline: 0;
+    }
+    #overlay {
+      position: fixed;
+      inset: 0;
+      padding: 12px;
+      font: 14px monospace;
+      overflow: auto;
+      pointer-events: none;
+      text-shadow: 0 1px 2px #000;
+      margin: 0;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="canvas" width="960" height="600"></canvas>
+  <pre id="overlay"></pre>
+  <script>
+    const canvas = document.getElementById("canvas");
+    const overlay = document.getElementById("overlay");
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      throw new Error("2D canvas context unavailable");
+    }
+
+    const W = canvas.width;
+    const H = canvas.height;
+
+    let audioCtx = null;
+    try {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (AudioCtx) {
+        audioCtx = new AudioCtx();
+      }
+    } catch {
+      audioCtx = null;
+    }
+
+    window.addEventListener("pointerdown", () => {
+      if (audioCtx && audioCtx.state === "suspended") {
+        audioCtx.resume().catch(() => {});
+      }
+    });
+
+    function beep(freq = 440) {
+      if (!audioCtx || audioCtx.state !== "running") {
+        return;
+      }
+      try {
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        const now = audioCtx.currentTime;
+        osc.type = "sine";
+        osc.frequency.value = freq;
+        gain.gain.setValueAtTime(0.06, now);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.12);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start();
+        osc.stop(now + 0.12);
+      } catch {
+        // Ignore audio context restrictions
+      }
+    }
+
+    const speedChoices = [-5, -4, 4, 5];
+    const randomUniform = (min, max) => min + Math.random() * (max - min);
+    const randomInt = (min, max) => Math.floor(randomUniform(min, max + 1));
+    const randomChoice = (arr) => arr[Math.floor(Math.random() * arr.length)];
+
+    const balls = Array.from({ length: 6 }, (_, i) => {
+      const r = randomInt(16, 26);
+      const padX = Math.min(80, Math.max(r, W / 2));
+      const padY = Math.min(80, Math.max(r, H / 2));
+      return {
+        x: randomUniform(padX, Math.max(padX, W - padX)),
+        y: randomUniform(padY, Math.max(padY, H - padY)),
+        vx: randomChoice(speedChoices),
+        vy: randomChoice(speedChoices),
+        r,
+        hue: i * 55,
+        freq: 280 + i * 70
+      };
+    });
+
+    const msg = "HTML Neon Physics running! Bounces trigger WebAudio chimes.";
+    overlay.textContent = msg + "\n";
+    console.log(msg);
+
+    function loop() {
+      ctx.fillStyle = "rgba(10, 10, 18, 0.35)";
+      ctx.fillRect(0, 0, W, H);
+      for (const b of balls) {
+        b.x += b.vx;
+        b.y += b.vy;
+        if (b.x - b.r < 0) {
+          b.x = b.r;
+          b.vx = Math.abs(b.vx);
+          beep(b.freq);
+        } else if (b.x + b.r > W) {
+          b.x = W - b.r;
+          b.vx = -Math.abs(b.vx);
+          beep(b.freq);
+        }
+        if (b.y - b.r < 0) {
+          b.y = b.r;
+          b.vy = Math.abs(b.vy);
+          beep(b.freq * 1.25);
+        } else if (b.y + b.r > H) {
+          b.y = H - b.r;
+          b.vy = -Math.abs(b.vy);
+          beep(b.freq * 1.25);
+        }
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
+        ctx.fillStyle = `hsl(${b.hue}, 90%, 60%)`;
+        ctx.fill();
+      }
+      requestAnimationFrame(loop);
+    }
+
+    requestAnimationFrame(loop);
+  </script>
+</body>
+</html>
