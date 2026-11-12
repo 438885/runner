@@ -852,7 +852,7 @@
     const interruptView = interruptBuffer ? new Uint8Array(interruptBuffer) : null;
 
     const PYTHON_BOOT_CODE = String.raw`
-import ast, asyncio, base64, builtins, concurrent.futures as cf, io, js, micropip, os, pyodide, pyodide.code, pyodide.ffi, pyodide_js, re, shutil, sys, time, tokenize, traceback
+import ast, asyncio, base64, builtins, concurrent.futures as cf, gc, io, js, micropip, os, platform, pyodide, pyodide.code, pyodide.ffi, pyodide_js, re, shutil, sys, time, tokenize, traceback
 _WORKSPACE_ROOT = "/workspace"
 os.makedirs(_WORKSPACE_ROOT, exist_ok=True); os.chdir(_WORKSPACE_ROOT)
 _ORIG_SLEEP = time.sleep
@@ -862,6 +862,7 @@ _ORIG_ENSURE_FUTURE = asyncio.ensure_future
 _ORIG_CREATE_PROXY = pyodide.ffi.create_proxy
 _ORIG_CREATE_ONCE = pyodide.ffi.create_once_callable
 _BASELINE_MODULES = set(sys.modules.keys())
+_BOOT_TIME = time.perf_counter()
 _stop_requested = False
 _in_user_code = False
 _run_gen = 0
@@ -870,6 +871,17 @@ _handles = set()
 _proxies = []
 _current_main_task = None
 PKG = {"PIL":"pillow","cv2":"opencv-python","sklearn":"scikit-learn","bs4":"beautifulsoup4","yaml":"pyyaml","pygame":"pygame-ce","turtle":"basthon-turtle"}
+
+def _boot_banner():
+    py_ver = sys.version.replace("\n", " ")
+    arch = f"{platform.system()} {platform.machine()} ({sys.platform})"
+    mp_ver = getattr(micropip, "__version__", "builtin")
+    pyodide_ver = getattr(pyodide, "__version__", "0.27.2")
+    print(f"[CPYTHON] Python {py_ver}")
+    print(f"[CPYTHON] Target: {arch} | Pyodide: v{pyodide_ver} | micropip: v{mp_ver}")
+    print(f"[CPYTHON] Baseline stdlib modules: {len(_BASELINE_MODULES)} | Recursion limit: {sys.getrecursionlimit()} | GC: {'enabled' if gc.isenabled() else 'disabled'}")
+
+_boot_banner()
 
 def _on_task_done(t):
     _tasks.discard(t)
@@ -1052,36 +1064,55 @@ async def _run_entry(entry_rel):
     _in_user_code = False
     _current_main_task = asyncio.current_task()
 
+    evicted = 0
     for m in list(sys.modules.keys()):
         if m not in _BASELINE_MODULES:
             mod = sys.modules.get(m)
             f = getattr(mod, "__file__", "") or ""
             if f.startswith(_WORKSPACE_ROOT) or f.startswith("<"):
                 sys.modules.pop(m, None)
+                evicted += 1
+    if evicted:
+        print(f"[CACHE] Reloaded {evicted} workspace module(s)")
 
     abs_entry = os.path.normpath(os.path.join(_WORKSPACE_ROOT, entry_rel))
     entry_dir = os.path.dirname(abs_entry)
     os.chdir(entry_dir); sys.path[:] = [entry_dir, _WORKSPACE_ROOT] + [p for p in sys.path if p not in (entry_dir, _WORKSPACE_ROOT)]
     with tokenize.open(abs_entry) as fp: code = fp.read()
 
+    line_count = len(code.splitlines())
+    byte_count = len(code.encode("utf-8"))
+    print(f"[ENTRY] Target: {abs_entry} ({line_count} lines, {byte_count} bytes)")
+
     found = sorted(set(pyodide.code.find_imports(code)))
-    missing = [p for p in found if p not in sys.modules and not os.path.exists(os.path.join(entry_dir, f"{p}.py")) and not os.path.exists(os.path.join(_WORKSPACE_ROOT, f"{p}.py"))]
+    local_mods = [p for p in found if os.path.exists(os.path.join(entry_dir, f"{p}.py")) or os.path.exists(os.path.join(_WORKSPACE_ROOT, f"{p}.py"))]
+    preloaded = [p for p in found if p in sys.modules and p not in local_mods]
+    missing = [p for p in found if p not in sys.modules and p not in local_mods]
+
+    print(f"[AST] Imports detected ({len(found)}): {', '.join(found) if found else 'none'}")
+    if preloaded:
+        print(f"[DEPS] Stdlib / cached ({len(preloaded)}): {', '.join(preloaded)}")
+    if local_mods:
+        print(f"[DEPS] Local workspace modules ({len(local_mods)}): {', '.join(local_mods)}")
+
     if missing and not _stop_requested:
-        print(f"[PY-PKG] Resolving imports: {', '.join(missing)}")
+        t_pkg = time.perf_counter()
+        print(f"[DEPS] Resolving external packages ({len(missing)}): {', '.join(missing)}...")
         try:
             await pyodide_js.loadPackagesFromImports("\n".join(f"import {m}" for m in missing))
         except Exception as e:
-            print(f"[PY-PKG] Pyodide loadPackagesFromImports note: {e}")
+            print(f"[DEPS] Pyodide package loader note: {e}")
     for p in missing:
         if _stop_requested: break
         if not sys.modules.get(p):
             pkg_name = PKG.get(p, p)
             try:
-                print(f"[PY-PKG] Installing '{pkg_name}' via micropip...")
+                t_mp = time.perf_counter()
+                print(f"[DEPS] Fetching wheel '{pkg_name}' via micropip...")
                 await micropip.install(pkg_name)
-                print(f"[PY-PKG] Installed '{pkg_name}' successfully.")
+                print(f"[DEPS] Installed '{pkg_name}' in {(time.perf_counter() - t_mp)*1000:.0f}ms")
             except Exception as e:
-                sys.stderr.write(f"[PY-PKG] Failed to install '{pkg_name}': {e}\n")
+                sys.stderr.write(f"[DEPS] Failed to install '{pkg_name}': {e}\n")
 
     if _stop_requested:
         return None
@@ -1113,6 +1144,8 @@ async def _run_entry(entry_rel):
         "canvas": canvas_el,
         "builtins": builtins
     }
+    print(f"[EXEC] Launching __main__ ({entry_rel}) | Uptime: {(time.perf_counter() - _BOOT_TIME):.2f}s")
+    print("─" * 62)
     _in_user_code = True
     try:
         res = await pyodide.code.eval_code_async(code, globals=globs, filename=abs_entry)
@@ -1137,7 +1170,7 @@ async def _run_entry(entry_rel):
     const IFRAME_HTML = `<!DOCTYPE html><html><head>
 <script src="https://unpkg.com/@tailwindcss/browser@4"><\/script>
 <style type="text/tailwindcss">@import "tailwindcss";</style>
-<style>*{margin:0;box-sizing:border-box}body{background:#000;color:#fff;overflow:hidden;width:100vw;height:100vh}#canvas{position:fixed;inset:0;width:100vw;height:100vh;object-fit:contain;outline:0}#o{position:fixed;inset:0;padding:12px;font:14px monospace;overflow:auto;pointer-events:none;text-shadow:0 1px 2px #000}</style>
+<style>*{margin:0;box-sizing:border-box}body{background:#000;color:#fff;overflow:hidden;width:100vw;height:100vh}#canvas{position:fixed;inset:0;width:100vw;height:100vh;object-fit:contain;outline:0}#o{position:fixed;inset:0;padding:12px;font:12.5px/1.45 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;overflow:auto;pointer-events:none;text-shadow:0 1px 3px rgba(0,0,0,0.95);color:#e4e4e7;white-space:pre-wrap}</style>
 </head><body><canvas id="canvas" width="960" height="600" tabindex="-1"></canvas><pre id="o"></pre>
 <script type="module">
 import * as Comlink from "https://cdn.jsdelivr.net/npm/comlink@4.4.2/+esm";
@@ -1145,10 +1178,24 @@ const canvas=document.getElementById("canvas"), o=document.getElementById("o"), 
 window.canvas = canvas;
 window.c = canvas;
 let py=null, pyP=null, bootCode="", intBuf=null, onLog=null, onErr=null;
-let stopped=false, tracking=false, currentEpoch=0;
+let stopped=false, tracking=false, currentEpoch=0, isColdBoot=false, bootT0=performance.now();
 
 const sendHostLog = (level, msg) => {
   try { parent.postMessage({ type: "SANDBOX_LOG", level, messages: [String(msg)] }, "*"); } catch {}
+};
+
+const log = (t, err=false) => {
+  o.append(t + "\\n");
+  o.scrollTop = o.scrollHeight;
+  (err && onErr ? onErr : onLog)?.(t);
+};
+
+const bootStep = (tag, msg) => {
+  const dt = "+" + (performance.now() - bootT0).toFixed(0).padStart(4, " ") + "ms";
+  const line = "[" + dt + "] [" + tag + "] " + msg;
+  o.append(line + "\\n");
+  o.scrollTop = o.scrollHeight;
+  sendHostLog("PY_BOOT", "[" + tag + "] " + msg);
 };
 
 for (const l of ["log", "info", "warn", "error", "debug"]) {
@@ -1367,41 +1414,84 @@ function cleanupRuntime() {
 }
 
 canvas.onpointerdown = () => canvas.focus();
-const log = (t, err=false) => { o.append(t + "\\n"); o.scrollTop = o.scrollHeight; (err && onErr ? onErr : onLog)?.(t); };
+
 async function ensurePy() {
   if (pyP) return pyP;
+  isColdBoot = true;
+  bootT0 = performance.now();
   return pyP = (async () => {
-    const t0 = performance.now();
-    o.textContent = "Loading Pyodide WebAssembly...";
-    sendHostLog("PYODIDE", "Downloading & initializing Pyodide v0.27.2 WebAssembly runtime...");
+    o.textContent = "╔══════════════════════════════════════════════════════════════╗\\n║       PYODIDE WEBASSEMBLY PYTHON RUNTIME BOOTLOADER          ║\\n╚══════════════════════════════════════════════════════════════╝\\n";
+    const hasWebGL2 = Boolean(document.createElement("canvas").getContext("webgl2"));
+    const cores = navigator.hardwareConcurrency || "n/a";
+    const mem = navigator.deviceMemory ? navigator.deviceMemory + " GB" : "n/a";
+    bootStep("ENV", "Host: " + (navigator.platform || "Web") + " | Threads: " + cores + " | RAM: " + mem + " | COI: " + Boolean(window.crossOriginIsolated));
+    bootStep("ENV", "Display: #canvas (" + canvas.width + "x" + canvas.height + ") | 2D: true | WebGL2: " + hasWebGL2 + " | WebAudio: " + Boolean(OrigAudioContext));
+    bootStep("ENV", "Interrupts: " + (intBuf ? "SharedArrayBuffer SIGINT (1-byte hardware interrupt)" : "Cooperative async/sleep yield fallback"));
+    bootStep("NET", "Importing Pyodide v0.27.2 ESM bootstrapper from cdn.jsdelivr.net...");
+
+    const tImport = performance.now();
     const { loadPyodide } = await import("https://cdn.jsdelivr.net/pyodide/v0.27.2/full/pyodide.mjs");
+    bootStep("NET", "ESM loader fetched in " + (performance.now() - tImport).toFixed(0) + "ms. Downloading & compiling CPython WASM + stdlib...");
+
+    const tWasm = performance.now();
     py = await loadPyodide({ stdout: s => log(s), stderr: s => log(s, true) });
+    const heapMb = py._module?.HEAPU8 ? (py._module.HEAPU8.byteLength / 1048576).toFixed(1) + " MB" : "initialized";
+    bootStep("WASM", "CPython WebAssembly VM instantiated in " + (performance.now() - tWasm).toFixed(0) + "ms (Initial WASM Heap: " + heapMb + ")");
+
     py._module.canvas = canvas;
     py.canvas?.setCanvas2D?.(canvas);
     py.canvas?.setCanvas3D?.(canvas);
-    if (intBuf) try { py.setInterruptBuffer(intBuf); } catch {}
+    bootStep("SDL2", "Bound HTML5 #canvas surface to Pyodide 2D & 3D rendering backends");
+
+    if (intBuf) {
+      try {
+        py.setInterruptBuffer(intBuf);
+        bootStep("SIGINT", "Attached SharedArrayBuffer interrupt vector to CPython VM");
+      } catch (e) {
+        bootStep("SIGINT", "Interrupt buffer attachment skipped: " + (e?.message || e));
+      }
+    }
+
+    const tPkg = performance.now();
+    bootStep("PKG", "Loading core wheel installer (micropip + packaging)...");
     await py.loadPackage(["micropip"]);
-    if (bootCode) py.runPython(bootCode);
-    sendHostLog("PYODIDE", "Pyodide v0.27.2 + micropip ready in " + (performance.now() - t0).toFixed(0) + "ms");
+    bootStep("PKG", "micropip package manager ready in " + (performance.now() - tPkg).toFixed(0) + "ms");
+
+    if (bootCode) {
+      bootStep("HOOKS", "Installing runtime hooks (asyncio task supervisor, FFI proxy guard, Pygame/SDL audio cleanup)...");
+      py.runPython(bootCode);
+    }
+    bootStep("READY", "Cold boot completed in " + (performance.now() - bootT0).toFixed(0) + "ms");
     return py;
   })();
 }
 Comlink.expose({
   configure(b, out, err, sb) { bootCode = b; onLog = out; onErr = err; if (sb) intBuf = new Uint8Array(sb); },
   async sync(files) {
+    const wasLoaded = Boolean(py);
     const p = await ensurePy();
     stopped = true; tracking = false;
     try { p.runPython("_reset_workspace()"); } catch {}
     cleanupRuntime();
+    if (wasLoaded && !isColdBoot) {
+      bootT0 = performance.now();
+      o.textContent = "╔══════════════════════════════════════════════════════════════╗\\n║         PYODIDE PYTHON RUNTIME — WARM RELOAD SESSION         ║\\n╚══════════════════════════════════════════════════════════════╝\\n";
+      const heapMb = p._module?.HEAPU8 ? (p._module.HEAPU8.byteLength / 1048576).toFixed(1) + " MB" : "n/a";
+      bootStep("VM", "Reusing active CPython WASM instance | Heap: " + heapMb + " | Interrupts: " + (intBuf ? "SAB SIGINT" : "Cooperative"));
+    }
+    isColdBoot = false;
     let totalBytes = 0;
+    const summary = [];
     for (const { name, content } of files) {
       const full = W + "/" + name, d = full.slice(0, full.lastIndexOf("/"));
       if (d) try { p.FS.mkdirTree(d); } catch {}
       const u8 = typeof content === "string" ? new TextEncoder().encode(content) : content;
-      totalBytes += u8.byteLength || 0;
+      const sz = u8.byteLength || 0;
+      totalBytes += sz;
+      summary.push(name + " (" + sz + " B)");
       p.FS.writeFile(full, u8);
     }
-    sendHostLog("VFS", "Synced " + files.length + " file(s) (" + (totalBytes / 1024).toFixed(1) + " KB) to /workspace");
+    bootStep("VFS", "Mounted " + files.length + " file(s) (" + (totalBytes / 1024).toFixed(2) + " KB) into /workspace: " + summary.join(", "));
   },
   async runFile(entry) {
     if (intBuf) intBuf[0] = 0;
@@ -1409,7 +1499,7 @@ Comlink.expose({
     cleanupRuntime();
     try { p.runPython("_prepare_run()"); } catch {}
     stopped = false; tracking = true;
-    canvas.focus(); o.textContent = "";
+    canvas.focus();
     const fn = p.globals.get("_run_entry");
     try {
       await fn(entry);
@@ -1469,23 +1559,33 @@ Comlink.expose({
     function generateStandaloneHtml(entryName, files) {
       const entryCode = files.find((f) => f.name === entryName)?.content || "";
       const serializedFiles = JSON.stringify(files).replace(/<\/script>/gi, "<\\/script>");
-      return `<!DOCTYPE html><html lang="en" class="bg-zinc-950 text-zinc-100"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>${entryName} - Standalone</title><script src="https://unpkg.com/@tailwindcss/browser@4"><\/script><style type="text/tailwindcss">@import "tailwindcss";</style><script src="https://cdn.jsdelivr.net/pyodide/v0.27.2/full/pyodide.js"><\/script></head><body class="p-4 flex flex-col gap-3 min-h-screen font-mono"><div class="flex items-center justify-between border-b border-zinc-800 pb-2"><h3 class="font-bold text-sm text-blue-400">${entryName}</h3><div id="st" class="text-xs text-zinc-400">Loading Pyodide...</div></div><canvas id="canvas" width="960" height="600" tabindex="1" class="w-full max-h-[70vh] bg-black border border-zinc-800 rounded-lg object-contain"></canvas><pre id="o" class="bg-zinc-900 border border-zinc-800 p-3 rounded-lg text-xs overflow-auto max-h-48 whitespace-pre-wrap"></pre><script>
-const st=document.getElementById("st"), o=document.getElementById("o"), canvas=document.getElementById("canvas");
+      return `<!DOCTYPE html><html lang="en" class="bg-zinc-950 text-zinc-100"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>${entryName} - Standalone</title><script src="https://unpkg.com/@tailwindcss/browser@4"><\/script><style type="text/tailwindcss">@import "tailwindcss";</style><script src="https://cdn.jsdelivr.net/pyodide/v0.27.2/full/pyodide.js"><\/script></head><body class="p-4 flex flex-col gap-3 min-h-screen font-mono"><div class="flex items-center justify-between border-b border-zinc-800 pb-2"><h3 class="font-bold text-sm text-blue-400">${entryName}</h3><div id="st" class="text-xs text-zinc-400">Booting Pyodide...</div></div><canvas id="canvas" width="960" height="600" tabindex="1" class="w-full max-h-[70vh] bg-black border border-zinc-800 rounded-lg object-contain"></canvas><pre id="o" class="bg-zinc-900 border border-zinc-800 p-3 rounded-lg text-xs overflow-auto max-h-56 whitespace-pre-wrap"></pre><script>
+const st=document.getElementById("st"), o=document.getElementById("o"), canvas=document.getElementById("canvas"), t0=performance.now();
 window.canvas = canvas;
 const print=(m)=>{ o.textContent+=m+"\\n"; o.scrollTop=o.scrollHeight; };
+const boot=(tag,m)=>{ const dt="+"+(performance.now()-t0).toFixed(0)+"ms"; st.textContent="["+tag+"] "+m; print("["+dt+"] ["+tag+"] "+m); };
 async function init(){
   try{
-    const pyodide=await loadPyodide({stdout:print,stderr:print}); pyodide.canvas.setCanvas2D(canvas);
-    for(const f of ${serializedFiles}){
+    boot("ENV", "Host: "+(navigator.platform||"Web")+" | Cores: "+(navigator.hardwareConcurrency||"n/a")+" | Canvas: "+canvas.width+"x"+canvas.height);
+    boot("WASM", "Initializing Pyodide v0.27.2 WebAssembly runtime...");
+    const pyodide=await loadPyodide({stdout:print,stderr:print});
+    pyodide.canvas.setCanvas2D(canvas);
+    boot("WASM", "CPython ready ("+pyodide.runPython("import sys; sys.version.split()[0]")+")");
+    const files=${serializedFiles};
+    for(const f of files){
       const d=f.name.slice(0,f.name.lastIndexOf("/")); if(d) try{pyodide.FS.mkdirTree(d)}catch{}
       pyodide.FS.writeFile(f.name, f.isBinary ? Uint8Array.from(atob(f.content), x=>x.charCodeAt(0)) : f.content);
     }
+    boot("VFS", "Mounted "+files.length+" workspace file(s)");
+    boot("PKG", "Loading micropip & scanning AST imports...");
     await pyodide.loadPackage(["micropip"]);
     try{await pyodide.loadPackagesFromImports(${JSON.stringify(entryCode)})}catch{}
-    st.textContent="Running..."; 
+    boot("EXEC", "Running ${entryName}...");
+    print("─".repeat(60));
+    st.textContent="Running ${entryName}...";
     await pyodide.runPythonAsync("import builtins, js; builtins.canvas = js.document.getElementById('canvas');\\n" + ${JSON.stringify(entryCode)});
     st.textContent="Finished.";
-  }catch(e){ st.textContent="Error: "+e.message; print("[Error] "+e.message); }
+  }catch(e){ st.textContent="Error: "+e.message; print("[Error] "+(e.stack||e.message)); }
 }
 init();
 <\/script></body></html>`;
@@ -1509,29 +1609,348 @@ init();
         name: "HTML Neon Physics & Synth",
         lang: "HTML",
         entry: "index.html",
+        // url: "./examples/html/chimes/index.html"
         // url: encodeDataUrl("text/html", `<!---->`, "index.html")
-        url: "./examples/html/chimes/index.js"
+        url: encodeDataUrl("text/html", `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>HTML Neon Physics &amp; Synth</title>
+  <style>
+    html, body {
+      margin: 0;
+      background: #000;
+      color: #fff;
+      overflow: hidden;
+      width: 100vw;
+      height: 100vh;
+    }
+    #canvas {
+      position: fixed;
+      inset: 0;
+      width: 100vw;
+      height: 100vh;
+      object-fit: contain;
+      outline: 0;
+    }
+    #overlay {
+      position: fixed;
+      inset: 0;
+      padding: 12px;
+      font: 14px monospace;
+      overflow: auto;
+      pointer-events: none;
+      text-shadow: 0 1px 2px #000;
+      margin: 0;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="canvas" width="960" height="600"></canvas>
+  <pre id="overlay"></pre>
+  <script>
+    const canvas = document.getElementById("canvas");
+    const overlay = document.getElementById("overlay");
+    const ctx = canvas.getContext("2d");
+    const W = canvas.width;
+    const H = canvas.height;
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    const audioCtx = new AudioCtx();
+    window.addEventListener("pointerdown", () => {
+      if (audioCtx.state === "suspended") audioCtx.resume();
+    });
+    function beep(freq = 440) {
+      try {
+        if (audioCtx.state === "suspended") {
+          audioCtx.resume();
+        }
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = "sine";
+        osc.frequency.value = freq;
+        gain.gain.setValueAtTime(0.06, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.12);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start();
+        osc.stop(audioCtx.currentTime + 0.12);
+      } catch {
+        // Ignore audio context restrictions
+      }
+    }
+    const speedChoices = [-5, -4, 4, 5];
+    const randomUniform = (min, max) => min + Math.random() * (max - min);
+    const randomInt = (min, max) => Math.floor(randomUniform(min, max + 1));
+    const randomChoice = (arr) => arr[Math.floor(Math.random() * arr.length)];
+    const balls = Array.from({ length: 6 }, (_, i) => ({
+      x: randomUniform(80, W - 80),
+      y: randomUniform(80, H - 80),
+      vx: randomChoice(speedChoices),
+      vy: randomChoice(speedChoices),
+      r: randomInt(16, 26),
+      hue: i * 55,
+      freq: 280 + i * 70
+    }));
+    const msg = "HTML Neon Physics running! Bounces trigger WebAudio chimes.";
+    overlay.textContent = msg + "\\n";
+    console.log(msg);
+    function loop() {
+      ctx.fillStyle = "rgba(10, 10, 18, 0.35)";
+      ctx.fillRect(0, 0, W, H);
+      for (const b of balls) {
+        b.x += b.vx;
+        b.y += b.vy;
+        if (b.x - b.r < 0 || b.x + b.r > W) {
+          b.vx *= -1;
+          beep(b.freq);
+        }
+        if (b.y - b.r < 0 || b.y + b.r > H) {
+          b.vy *= -1;
+          beep(b.freq * 1.25);
+        }
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
+        ctx.fillStyle = \`hsl(\${b.hue}, 90%, 60%)\`;
+        ctx.fill();
+      }
+      requestAnimationFrame(loop);
+    }
+    requestAnimationFrame(loop);
+  </script>
+</body>
+</html>
+`, "index.html")
       },
       {
         name: "JavaScript Neon Physics & Synth",
         lang: "JavaScript",
         entry: "main.js",
+        // url: "./examples/javascript/chimes/main.js"
         // url: encodeDataUrl("text/javascript", `;`, "main.js")
-        url: "./examples/javascript/chimes/main.js"
+        url: encodeDataUrl("text/javascript", `
+document.body.className = "m-0 bg-black text-white overflow-hidden w-screen h-screen";
+const canvas = document.createElement("canvas");
+canvas.id = "canvas";
+canvas.width = 960;
+canvas.height = 600;
+canvas.style.cssText = "position:fixed;inset:0;width:100vw;height:100vh;object-fit:contain;outline:0";
+const overlay = document.createElement("pre");
+overlay.style.cssText = "position:fixed;inset:0;padding:12px;font:14px monospace;overflow:auto;pointer-events:none;text-shadow:0 1px 2px #000;margin:0";
+document.body.replaceChildren(canvas, overlay);
+const ctx = canvas.getContext("2d");
+const W = canvas.width;
+const H = canvas.height;
+const AudioCtx = window.AudioContext || window.webkitAudioContext;
+const audioCtx = new AudioCtx();
+window.addEventListener("pointerdown", () => {
+  if (audioCtx.state === "suspended") audioCtx.resume();
+});
+function beep(freq = 440) {
+  try {
+    if (audioCtx.state === "suspended") {
+      audioCtx.resume();
+    }
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = "sine";
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.06, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.12);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + 0.12);
+  } catch {
+    // Ignore audio context restrictions
+  }
+}
+const speedChoices = [-5, -4, 4, 5];
+const randomUniform = (min, max) => min + Math.random() * (max - min);
+const randomInt = (min, max) => Math.floor(randomUniform(min, max + 1));
+const randomChoice = (arr) => arr[Math.floor(Math.random() * arr.length)];
+const balls = Array.from({ length: 6 }, (_, i) => ({
+  x: randomUniform(80, W - 80),
+  y: randomUniform(80, H - 80),
+  vx: randomChoice(speedChoices),
+  vy: randomChoice(speedChoices),
+  r: randomInt(16, 26),
+  hue: i * 55,
+  freq: 280 + i * 70
+}));
+const msg = "JavaScript Neon Physics running! Bounces trigger WebAudio chimes.";
+overlay.textContent = msg + "\\n";
+console.log(msg);
+function loop() {
+  ctx.fillStyle = "rgba(10, 10, 18, 0.35)";
+  ctx.fillRect(0, 0, W, H);
+  for (const b of balls) {
+    b.x += b.vx;
+    b.y += b.vy;
+    if (b.x - b.r < 0 || b.x + b.r > W) {
+      b.vx *= -1;
+      beep(b.freq);
+    }
+    if (b.y - b.r < 0 || b.y + b.r > H) {
+      b.vy *= -1;
+      beep(b.freq * 1.25);
+    }
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
+    ctx.fillStyle = \`hsl(\${b.hue}, 90%, 60%)\`;
+    ctx.fill();
+  }
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+`, "main.js")
       },
       {
         name: "TypeScript Neon Physics & Synth",
         lang: "TypeScript",
         entry: "main.ts",
+        // url: "./examples/typescript/chimes/main.ts"
         // url: encodeDataUrl("text/typescript", `;`, "main.ts")
-        url: "./examples/typescript/chimes/main.ts"
+        url: encodeDataUrl("text/typescript", `
+interface Ball {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  r: number;
+  hue: number;
+  freq: number;
+}
+document.body.className = "m-0 bg-black text-white overflow-hidden w-screen h-screen";
+const canvas = document.createElement("canvas");
+canvas.id = "canvas";
+canvas.width = 960;
+canvas.height = 600;
+canvas.style.cssText = "position:fixed;inset:0;width:100vw;height:100vh;object-fit:contain;outline:0";
+const overlay = document.createElement("pre");
+overlay.style.cssText = "position:fixed;inset:0;padding:12px;font:14px monospace;overflow:auto;pointer-events:none;text-shadow:0 1px 2px #000;margin:0";
+document.body.replaceChildren(canvas, overlay);
+const ctx = canvas.getContext("2d")!;
+const W = canvas.width;
+const H = canvas.height;
+const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+const audioCtx = new AudioCtx();
+window.addEventListener("pointerdown", () => {
+  if (audioCtx.state === "suspended") audioCtx.resume();
+});
+function beep(freq: number = 440): void {
+  try {
+    if (audioCtx.state === "suspended") {
+      audioCtx.resume();
+    }
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = "sine";
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.06, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.12);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + 0.12);
+  } catch {
+    // Ignore audio context restrictions
+  }
+}
+const speedChoices = [-5, -4, 4, 5];
+const randomUniform = (min: number, max: number): number => min + Math.random() * (max - min);
+const randomInt = (min: number, max: number): number => Math.floor(randomUniform(min, max + 1));
+const randomChoice = <T,>(arr: T[]): T => arr[Math.floor(Math.random() * arr.length)];
+const balls: Ball[] = Array.from({ length: 6 }, (_, i) => ({
+  x: randomUniform(80, W - 80),
+  y: randomUniform(80, H - 80),
+  vx: randomChoice(speedChoices),
+  vy: randomChoice(speedChoices),
+  r: randomInt(16, 26),
+  hue: i * 55,
+  freq: 280 + i * 70
+}));
+const msg = "TypeScript Neon Physics running! Bounces trigger WebAudio chimes.";
+overlay.textContent = msg + "\\n";
+console.log(msg);
+function loop(): void {
+  ctx.fillStyle = "rgba(10, 10, 18, 0.35)";
+  ctx.fillRect(0, 0, W, H);
+  for (const b of balls) {
+    b.x += b.vx;
+    b.y += b.vy;
+    if (b.x - b.r < 0 || b.x + b.r > W) {
+      b.vx *= -1;
+      beep(b.freq);
+    }
+    if (b.y - b.r < 0 || b.y + b.r > H) {
+      b.vy *= -1;
+      beep(b.freq * 1.25);
+    }
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
+    ctx.fillStyle = \`hsl(\${b.hue}, 90%, 60%)\`;
+    ctx.fill();
+  }
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+`, "main.ts")
       },
       {
         name: "Python Neon Physics & Synth",
         lang: "Python",
         entry: "main.py",
+        // url: "./examples/typescript/chimes/main.py"
         // url: encodeDataUrl("text/x-python", `pass`, "main.py")
-        url: "./examples/typescript/chimes/main.py"
+        url: encodeDataUrl("text/x-python", `
+import asyncio, math, random, js
+from pyodide.ffi import create_proxy
+ctx = canvas.getContext("2d")
+W, H = canvas.width, canvas.height
+audio_ctx = js.AudioContext.new()
+def beep(freq=440):
+    try:
+        if audio_ctx.state == "suspended":
+            audio_ctx.resume()
+        osc = audio_ctx.createOscillator()
+        gain = audio_ctx.createGain()
+        osc.type = "sine"
+        osc.frequency.value = freq
+        gain.gain.setValueAtTime(0.06, audio_ctx.currentTime)
+        gain.gain.exponentialRampToValueAtTime(0.001, audio_ctx.currentTime + 0.12)
+        osc.connect(gain)
+        gain.connect(audio_ctx.destination)
+        osc.start()
+        osc.stop(audio_ctx.currentTime + 0.12)
+    except Exception:
+        pass
+balls = [
+    {"x": random.uniform(80, W-80), "y": random.uniform(80, H-80),
+     "vx": random.choice([-5, -4, 4, 5]), "vy": random.choice([-5, -4, 4, 5]),
+     "r": random.randint(16, 26), "hue": i * 55, "freq": 280 + i * 70}
+    for i in range(6)
+]
+print("Python Neon Physics running! Bounces trigger WebAudio chimes.")
+while True:
+    ctx.fillStyle = "rgba(10, 10, 18, 0.35)"
+    ctx.fillRect(0, 0, W, H)
+    for b in balls:
+        b["x"] += b["vx"]
+        b["y"] += b["vy"]
+        if b["x"] - b["r"] < 0 or b["x"] + b["r"] > W:
+            b["vx"] *= -1
+            beep(b["freq"])
+        if b["y"] - b["r"] < 0 or b["y"] + b["r"] > H:
+            b["vy"] *= -1
+            beep(b["freq"] * 1.25)
+        ctx.beginPath()
+        ctx.arc(b["x"], b["y"], b["r"], 0, math.pi * 2)
+        ctx.fillStyle = f"hsl({b['hue']}, 90%, 60%)"
+        ctx.fill()
+    await asyncio.sleep(1 / 60)
+`, "main.py")        
       }
     ];
 
