@@ -39,6 +39,8 @@
 
   //#region 2: DOMAndStylesManager
   const DOM = (() => {
+    const SANDBOX_ATTR = "allow-scripts allow-modals allow-forms allow-popups allow-same-origin";
+    
     const twStyle = document.createElement("style");
     twStyle.setAttribute("type", "text/tailwindcss");
     twStyle.textContent = `@import "tailwindcss";`;
@@ -109,7 +111,7 @@
         </header>
 
         <main id="runnerArea" class="flex-1 w-full h-[calc(100vh-44px)] relative bg-black overflow-hidden">
-          <iframe id="sandbox" class="w-full h-full border-0 block bg-white" sandbox="allow-scripts allow-modals allow-forms allow-popups"></iframe>
+          <iframe id="sandbox" class="w-full h-full border-0 block bg-white" sandbox="${SANDBOX_ATTR}"></iframe>
           <div id="canvasContainer" class="w-full h-full hidden bg-black"></div>
         </main>
 
@@ -143,7 +145,7 @@
         const fresh = document.createElement("iframe");
         fresh.id = "sandbox";
         fresh.className = refs.sandbox.className;
-        fresh.setAttribute("sandbox", "allow-scripts allow-modals allow-forms allow-popups");
+        fresh.setAttribute("sandbox", SANDBOX_ATTR);
         refs.sandbox.replaceWith(fresh);
         refs.sandbox = fresh;
         return fresh;
@@ -1609,13 +1611,15 @@ init();
         name: "HTML Neon Physics & Synth",
         lang: "HTML",
         entry: "index.html",
+        // url: encodeDataUrl("text/html", `<!---->`, "index.html")
         url: "./examples/html/chimes/index.html"
       },
       {
         name: "JavaScript Neon Physics & Synth",
         lang: "JavaScript",
         entry: "main.js",
-        url: "./examples/html/chimes/main.js"
+        // url: encodeDataUrl("text/javascript", `;`, "main.js")
+        url: "./examples/html/chimes/index.html"
       },
       {
         name: "TypeScript Neon Physics & Synth",
