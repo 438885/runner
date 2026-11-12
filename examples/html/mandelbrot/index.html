@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>SharedArrayBuffer + Atomics vs. postMessage Benchmark</title>
+  <style>
+    body {
+      margin: 0;
+      background: #121212;
+      color: #eee;
+      font-family: system-ui, -apple-system, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 16px;
+      user-select: none;
+    }
+    .toolbar, .telemetry {
+      display: flex;
+      gap: 16px;
+      align-items: center;
+      background: #1e1e1e;
+      padding: 10px 18px;
+      border-radius: 8px;
+      margin-bottom: 10px;
+      border: 1px solid #333;
+      flex-wrap: wrap;
+      max-width: 860px;
+      width: 100%;
+      box-sizing: border-box;
+      justify-content: space-between;
+    }
+    .telemetry {
+      background: #161b22;
+      border-color: #2ea043;
+      font-family: monospace;
+      font-size: 13px;
+    }
+    .metric { display: flex; flex-direction: column; gap: 2px; }
+    .metric-label { color: #8b949e; font-size: 11px; text-transform: uppercase; }
+    .metric-value { color: #58a6ff; font-weight: bold; font-size: 14px; }
+    .metric-value.fps { color: #3fb950; }
+    canvas {
+      border: 1px solid #444;
+      border-radius: 6px;
+      cursor: grab;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.6);
+    }
+    canvas:active { cursor: grabbing; }
+    select, input[type="range"], button {
+      background: #2b2b2b;
+      color: #fff;
+      border: 1px solid #555;
+      padding: 5px 8px;
+      border-radius: 4px;
+      font-size: 13px;
+    }
+    select.mode-select {
+      border-color: #58a6ff;
+      font-weight: 600;
+      background: #1f2937;
+    }
+    .hint { font-size: 13px; color: #aaa; margin-top: 8px; }
+  </style>
+</head>
+<body>
+
+  <div class="toolbar">
+    <label>
+      Engine Mode:
+      <select id="engineMode" class="mode-select">
+        <option value="sab_tiles">ON: SharedArrayBuffer + Atomics (16×16 Dynamic Tiles)</option>
+        <option value="pm_tiles">OFF: postMessage Only (16×16 Dynamic Tiles)</option>
+        <option value="pm_strips">OFF: postMessage Only (Static Horizontal Strips)</option>
+      </select>
+    </label>
+
+    <label>
+      Max Iterations: <span id="iterVal">1500</span>
+      <input type="range" id="iterSlider" min="200" max="5000" step="100" value="1500">
+    </label>
+
+    <label>
+      <input type="checkbox" id="showThreads" checked>
+      Visualize Worker Threads
+    </label>
+
+    <button id="resetBtn">Reset View</button>
+  </div>
+
+  <div class="telemetry">
+    <div class="metric">
+      <span class="metric-label">Frame Time / FPS</span>
+      <span class="metric-value fps" id="statTime">-- ms (-- FPS)</span>
+    </div>
+    <div class="metric">
+      <span class="metric-label">Active Mode</span>
+      <span class="metric-value" id="statMode">Initializing...</span>
+    </div>
+    <div class="metric">
+      <span class="metric-label">postMessage Calls / Frame</span>
+      <span class="metric-value" id="statMsgs">0</span>
+    </div>
+    <div class="metric">
+      <span class="metric-label">Memory Copied / Frame</span>
+      <span class="metric-value" id="statMem">0 KB</span>
+    </div>
+  </div>
+
+  <canvas id="canvas" width="800" height="600"></canvas>
+  <div class="hint">
+    Drag to pan • Scroll wheel to zoom • Switch "Engine Mode" above to compare SharedArrayBuffer + Atomics vs. postMessage
+  </div>
+
+  <!-- ===================================================================== -->
+  <!-- INLINE WEB WORKER (Supports BOTH SharedArrayBuffer+Atomics & postMessage) -->
+  <!-- ===================================================================== -->
+  <script id="worker-code" type="javascript/worker">
+    const IDX_FRAME_ID = 0;
+    const IDX_NEXT_TILE = 1;
+    const IDX_WORKERS_DONE = 2;
+    const IDX_MAX_ITER = 3;
+    const IDX_VISUALIZE_THREADS = 4;
+    const IDX_EXIT_SAB = 5;
+
+    const WORKER_COLORS = [
+      [255, 80, 80],   [80, 255, 80],   [80, 150, 255],  [255, 255, 80],
+      [255, 80, 255],  [80, 255, 255],  [255, 160, 80],  [180, 80, 255]
+    ];
+
+    let workerId = 0;
+    let numWorkers = 4;
+    let width = 800;
+    let height = 600;
+    let tileSize = 16;
+    let intState = null;
+    let floatState = null;
+    let sharedPixels = null;
+
+    self.onmessage = function (e) {
+      const data = e.data;
+
+      if (data.type === 'init') {
+        workerId = data.workerId;
+        numWorkers = data.numWorkers;
+        width = data.width;
+        height = data.height;
+        tileSize = data.tileSize;
+
+        if (data.stateBuffer && data.pixelBuffer) {
+          intState = new Int32Array(data.stateBuffer, 0, 8);
+          floatState = new Float64Array(data.stateBuffer, 32, 4);
+          sharedPixels = new Uint32Array(data.pixelBuffer);
+        }
+        self.postMessage({ type: 'ready' });
+      }
+      // -------------------------------------------------------------------
+      // MODE 1: SharedArrayBuffer + Atomics persistent loop
+      // -------------------------------------------------------------------
+      else if (data.type === 'enterSabLoop') {
+        runSabAtomicsLoop(data.lastSeenFrame);
+      }
+      // -------------------------------------------------------------------
+      // MODE 2: WITHOUT SAB/Atomics - Render a single 16x16 tile & transfer
+      // -------------------------------------------------------------------
+      else if (data.type === 'renderTile') {
+        const { tx, ty, tw, th, centerX, centerY, scale, maxIter, showThreads } = data;
+        const tileBuf = new Uint32Array(tw * th);
+        renderRegion(tx, ty, tw, th, width, height, centerX, centerY, scale, maxIter, showThreads, workerId, tileBuf, true);
+        self.postMessage(
+          { type: 'tileDone', workerId, tx, ty, tw, th, buffer: tileBuf.buffer },
+          [tileBuf.buffer]
+        );
+      }
+      // -------------------------------------------------------------------
+      // MODE 3: WITHOUT SAB/Atomics - Render a horizontal strip & transfer
+      // -------------------------------------------------------------------
+      else if (data.type === 'renderStrip') {
+        const { startY, stripH, centerX, centerY, scale, maxIter, showThreads } = data;
+        const stripBuf = new Uint32Array(width * stripH);
+        renderRegion(0, startY, width, stripH, width, height, centerX, centerY, scale, maxIter, showThreads, workerId, stripBuf, true);
+        self.postMessage(
+          { type: 'stripDone', startY, stripH, buffer: stripBuf.buffer },
+          [stripBuf.buffer]
+        );
+      }
+    };
+
+    function runSabAtomicsLoop(lastSeenFrame) {
+      const tilesX = Math.ceil(width / tileSize);
+      const tilesY = Math.ceil(height / tileSize);
+      const totalTiles = tilesX * tilesY;
+
+      while (true) {
+        // Sleep until main thread increments IDX_FRAME_ID and calls Atomics.notify()
+        Atomics.wait(intState, IDX_FRAME_ID, lastSeenFrame);
+        lastSeenFrame = Atomics.load(intState, IDX_FRAME_ID);
+
+        // Check if main thread requested exit back to standard postMessage mode
+        if (Atomics.load(intState, IDX_EXIT_SAB) === 1) {
+          return;
+        }
+
+        const maxIter = Atomics.load(intState, IDX_MAX_ITER);
+        const showThreads = Atomics.load(intState, IDX_VISUALIZE_THREADS) === 1;
+        const centerX = floatState[0];
+        const centerY = floatState[1];
+        const scale = floatState[2];
+
+        // Lock-free atomic work stealing queue
+        while (true) {
+          const tileIndex = Atomics.add(intState, IDX_NEXT_TILE, 1);
+          if (tileIndex >= totalTiles) break;
+
+          const tx = (tileIndex % tilesX) * tileSize;
+          const ty = Math.floor(tileIndex / tilesX) * tileSize;
+          const tw = Math.min(tileSize, width - tx);
+          const th = Math.min(tileSize, height - ty);
+
+          renderRegion(tx, ty, tw, th, width, height, centerX, centerY, scale, maxIter, showThreads, workerId, sharedPixels, false);
+        }
+
+        // Atomic barrier: only the last worker notifies the main thread
+        const doneCount = Atomics.add(intState, IDX_WORKERS_DONE, 1) + 1;
+        if (doneCount === numWorkers) {
+          self.postMessage({ type: 'sabFrameDone' });
+        }
+      }
+    }
+
+    // Renders fractal pixels either into the full-canvas SharedArrayBuffer (isLocalBuffer=false)
+    // or into an isolated tile/strip ArrayBuffer for postMessage transfer (isLocalBuffer=true).
+    function renderRegion(startX, startY, regionW, regionH, fullW, fullH, centerX, centerY, scale, maxIter, showThreads, wId, targetPixels, isLocalBuffer) {
+      const wColor = WORKER_COLORS[wId % WORKER_COLORS.length];
+      const halfW = fullW / 2;
+      const halfH = fullH / 2;
+
+      for (let y = startY; y < startY + regionH; y++) {
+        const cy = centerY + (y - halfH) * scale;
+        const rowOffset = isLocalBuffer ? (y - startY) * regionW : y * fullW;
+
+        for (let x = startX; x < startX + regionW; x++) {
+          const cx = centerX + (x - halfW) * scale;
+
+          let zx = 0.0, zy = 0.0, zx2 = 0.0, zy2 = 0.0;
+          let iter = 0;
+
+          while (iter < maxIter && (zx2 + zy2) <= 4.0) {
+            zy = 2.0 * zx * zy + cy;
+            zx = zx2 - zy2 + cx;
+            zx2 = zx * zx;
+            zy2 = zy * zy;
+            iter++;
+          }
+
+          let r = 0, g = 0, b = 0;
+          if (iter < maxIter) {
+            const t = iter / maxIter;
+            r = Math.floor(9 * (1 - t) * t * t * t * 255);
+            g = Math.floor(15 * (1 - t) * (1 - t) * t * t * 255);
+            b = Math.floor(8.5 * (1 - t) * (1 - t) * (1 - t) * t * 255);
+          }
+
+          if (showThreads) {
+            if (x === startX || y === startY) {
+              r = wColor[0]; g = wColor[1]; b = wColor[2];
+            } else {
+              r = (r * 0.65 + wColor[0] * 0.35) | 0;
+              g = (g * 0.65 + wColor[1] * 0.35) | 0;
+              b = (b * 0.65 + wColor[2] * 0.35) | 0;
+            }
+          }
+
+          const colIdx = isLocalBuffer ? (x - startX) : x;
+          targetPixels[rowOffset + colIdx] = (255 << 24) | (b << 16) | (g << 8) | r;
+        }
+      }
+    }
+  </script>
+
+  <!-- ===================================================================== -->
+  <!-- MAIN THREAD ORCHESTRATOR                                              -->
+  <!-- ===================================================================== -->
+  <script>
+    const WIDTH = 800;
+    const HEIGHT = 600;
+    const TILE_SIZE = 16;
+    const TILES_X = Math.ceil(WIDTH / TILE_SIZE);
+    const TILES_Y = Math.ceil(HEIGHT / TILE_SIZE);
+    const TOTAL_TILES = TILES_X * TILES_Y;
+    const NUM_WORKERS = navigator.hardwareConcurrency || 4;
+
+    const IDX_FRAME_ID = 0;
+    const IDX_NEXT_TILE = 1;
+    const IDX_WORKERS_DONE = 2;
+    const IDX_MAX_ITER = 3;
+    const IDX_VISUALIZE_THREADS = 4;
+    const IDX_EXIT_SAB = 5;
+
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const imageData = ctx.createImageData(WIDTH, HEIGHT);
+    const destPixels32 = new Uint32Array(imageData.data.buffer);
+
+    const engineSelect = document.getElementById('engineMode');
+    const supportsSAB = window.crossOriginIsolated && typeof SharedArrayBuffer !== 'undefined';
+
+    let stateBuffer = null, intState = null, floatState = null;
+    let pixelBuffer = null, sharedPixelBytes = null;
+
+    if (supportsSAB) {
+      stateBuffer = new SharedArrayBuffer(64);
+      intState = new Int32Array(stateBuffer, 0, 8);
+      floatState = new Float64Array(stateBuffer, 32, 4);
+      pixelBuffer = new SharedArrayBuffer(WIDTH * HEIGHT * 4);
+      sharedPixelBytes = new Uint8ClampedArray(pixelBuffer);
+    } else {
+      // Gracefully fallback to postMessage mode if opened without COOP/COEP headers
+      engineSelect.options[0].disabled = true;
+      engineSelect.options[0].textContent += ' [Requires COOP/COEP Headers]';
+      engineSelect.value = 'pm_tiles';
+    }
+
+    let centerX = -0.7436438870371587;
+    let centerY = 0.13182590420531197;
+    let scale = 0.003;
+
+    let readyWorkers = 0;
+    let isRendering = false;
+    let pendingRender = false;
+    let frameStartTime = 0;
+
+    // State tracking for worker transitions and postMessage modes
+    let workerInSabLoop = false;
+    let sabFrameCounter = 0;
+    let pmNextTile = 0;
+    let pmCompletedUnits = 0;
+    let frameMsgCount = 0;
+    let frameBytesCopied = 0;
+
+    const workerBlob = new Blob(
+      [document.getElementById('worker-code').textContent],
+      { type: 'application/javascript' }
+    );
+    const workerUrl = URL.createObjectURL(workerBlob);
+    const workers = [];
+
+    for (let i = 0; i < NUM_WORKERS; i++) {
+      const worker = new Worker(workerUrl);
+      worker.onmessage = handleWorkerMessage;
+      worker.postMessage({
+        type: 'init',
+        workerId: i,
+        numWorkers: NUM_WORKERS,
+        width: WIDTH,
+        height: HEIGHT,
+        tileSize: TILE_SIZE,
+        stateBuffer,
+        pixelBuffer
+      });
+      workers.push(worker);
+    }
+
+    function handleWorkerMessage(e) {
+      const data = e.data;
+
+      if (data.type === 'ready') {
+        if (++readyWorkers === NUM_WORKERS) requestFrame();
+      }
+      // Completion callback for Mode 1 (SharedArrayBuffer + Atomics)
+      else if (data.type === 'sabFrameDone') {
+        frameMsgCount = 1; // Only 1 barrier message for the entire frame
+        frameBytesCopied = 0; // Zero bytes transferred across threads
+        imageData.data.set(sharedPixelBytes);
+        finishFrame('ON: SAB + Atomics (Zero-Copy)');
+      }
+      // Tile callback for Mode 2 (postMessage 16x16 Dynamic Tiles)
+      else if (data.type === 'tileDone') {
+        frameMsgCount++;
+        frameBytesCopied += data.buffer.byteLength;
+
+        // Blit transferred tile buffer into main thread ImageData
+        const tilePixels = new Uint32Array(data.buffer);
+        const { tx, ty, tw, th, workerId } = data;
+        for (let r = 0; r < th; r++) {
+          const srcOffset = r * tw;
+          const dstOffset = (ty + r) * WIDTH + tx;
+          destPixels32.set(tilePixels.subarray(srcOffset, srcOffset + tw), dstOffset);
+        }
+
+        pmCompletedUnits++;
+        if (pmNextTile < TOTAL_TILES) {
+          dispatchPmTile(workers[workerId]);
+        } else if (pmCompletedUnits === TOTAL_TILES) {
+          finishFrame('OFF: postMessage (16×16 Tiles)');
+        }
+      }
+      // Strip callback for Mode 3 (postMessage Static Strips)
+      else if (data.type === 'stripDone') {
+        frameMsgCount++;
+        frameBytesCopied += data.buffer.byteLength;
+
+        const stripBytes = new Uint8ClampedArray(data.buffer);
+        imageData.data.set(stripBytes, data.startY * WIDTH * 4);
+
+        if (++pmCompletedUnits === NUM_WORKERS) {
+          finishFrame('OFF: postMessage (Static Strips)');
+        }
+      }
+    }
+
+    function requestFrame() {
+      if (readyWorkers < NUM_WORKERS) return;
+      if (isRendering) {
+        pendingRender = true;
+        return;
+      }
+
+      isRendering = true;
+      frameStartTime = performance.now();
+      frameMsgCount = 0;
+      frameBytesCopied = 0;
+
+      const mode = engineSelect.value;
+      const maxIter = parseInt(document.getElementById('iterSlider').value, 10);
+      const showThreads = document.getElementById('showThreads').checked;
+
+      // =====================================================================
+      // PATH A: WITH SharedArrayBuffer + Atomics
+      // =====================================================================
+      if (mode === 'sab_tiles') {
+        if (!workerInSabLoop) {
+          Atomics.store(intState, IDX_EXIT_SAB, 0);
+          for (const w of workers) {
+            w.postMessage({ type: 'enterSabLoop', lastSeenFrame: sabFrameCounter });
+          }
+          workerInSabLoop = true;
+        }
+
+        floatState[0] = centerX;
+        floatState[1] = centerY;
+        floatState[2] = scale;
+
+        Atomics.store(intState, IDX_MAX_ITER, maxIter);
+        Atomics.store(intState, IDX_VISUALIZE_THREADS, showThreads ? 1 : 0);
+        Atomics.store(intState, IDX_NEXT_TILE, 0);
+        Atomics.store(intState, IDX_WORKERS_DONE, 0);
+
+        sabFrameCounter++;
+        Atomics.store(intState, IDX_FRAME_ID, sabFrameCounter);
+        Atomics.notify(intState, IDX_FRAME_ID, NUM_WORKERS);
+      }
+      // =====================================================================
+      // PATH B: WITHOUT SharedArrayBuffer + Atomics (Standard postMessage)
+      // =====================================================================
+      else {
+        // If workers are currently sleeping inside Atomics.wait(), wake them to exit
+        if (workerInSabLoop) {
+          Atomics.store(intState, IDX_EXIT_SAB, 1);
+          sabFrameCounter++;
+          Atomics.store(intState, IDX_FRAME_ID, sabFrameCounter);
+          Atomics.notify(intState, IDX_FRAME_ID, NUM_WORKERS);
+          workerInSabLoop = false;
+        }
+
+        pmCompletedUnits = 0;
+
+        if (mode === 'pm_tiles') {
+          pmNextTile = 0;
+          for (let i = 0; i < NUM_WORKERS; i++) {
+            if (pmNextTile < TOTAL_TILES) dispatchPmTile(workers[i]);
+          }
+        } else if (mode === 'pm_strips') {
+          const stripH = Math.ceil(HEIGHT / NUM_WORKERS);
+          for (let i = 0; i < NUM_WORKERS; i++) {
+            const startY = i * stripH;
+            const h = Math.min(stripH, Math.max(0, HEIGHT - startY));
+            frameMsgCount++;
+            workers[i].postMessage({
+              type: 'renderStrip',
+              startY,
+              stripH: h,
+              centerX,
+              centerY,
+              scale,
+              maxIter,
+              showThreads
+            });
+          }
+        }
+      }
+    }
+
+    function dispatchPmTile(worker) {
+      const tileIndex = pmNextTile++;
+      const tx = (tileIndex % TILES_X) * TILE_SIZE;
+      const ty = Math.floor(tileIndex / TILES_X) * TILE_SIZE;
+      const tw = Math.min(TILE_SIZE, WIDTH - tx);
+      const th = Math.min(TILE_SIZE, HEIGHT - ty);
+
+      frameMsgCount++;
+      worker.postMessage({
+        type: 'renderTile',
+        tx, ty, tw, th,
+        centerX, centerY, scale,
+        maxIter: parseInt(document.getElementById('iterSlider').value, 10),
+        showThreads: document.getElementById('showThreads').checked
+      });
+    }
+
+    function finishFrame(modeLabel) {
+      ctx.putImageData(imageData, 0, 0);
+      const elapsed = (performance.now() - frameStartTime).toFixed(1);
+      const fps = Math.round(1000 / Math.max(0.5, elapsed));
+
+      document.getElementById('statTime').textContent = `${elapsed} ms (${fps} FPS)`;
+      document.getElementById('statMode').textContent = `${modeLabel} [${NUM_WORKERS} Threads]`;
+      document.getElementById('statMsgs').textContent = `${frameMsgCount.toLocaleString()} msgs`;
+      document.getElementById('statMem').textContent =
+        frameBytesCopied === 0
+          ? '0 KB (Shared Memory)'
+          : `${(frameBytesCopied / 1024).toFixed(0)} KB (Transferred)`;
+
+      isRendering = false;
+      if (pendingRender) {
+        pendingRender = false;
+        requestFrame();
+      }
+    }
+
+    // Mouse Pan & Wheel Zoom
+    let isDragging = false, lastX = 0, lastY = 0;
+
+    canvas.addEventListener('mousedown', (e) => {
+      isDragging = true;
+      lastX = e.clientX;
+      lastY = e.clientY;
+    });
+
+    window.addEventListener('mousemove', (e) => {
+      if (!isDragging) return;
+      centerX -= (e.clientX - lastX) * scale;
+      centerY -= (e.clientY - lastY) * scale;
+      lastX = e.clientX;
+      lastY = e.clientY;
+      requestFrame();
+    });
+
+    window.addEventListener('mouseup', () => { isDragging = false; });
+
+    canvas.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+      const mouseX = e.clientX - rect.left - WIDTH / 2;
+      const mouseY = e.clientY - rect.top - HEIGHT / 2;
+
+      const worldX = centerX + mouseX * scale;
+      const worldY = centerY + mouseY * scale;
+
+      scale *= e.deltaY < 0 ? 0.82 : 1.22;
+      centerX = worldX - mouseX * scale;
+      centerY = worldY - mouseY * scale;
+      requestFrame();
+    }, { passive: false });
+
+    document.getElementById('iterSlider').addEventListener('input', (e) => {
+      document.getElementById('iterVal').textContent = e.target.value;
+      requestFrame();
+    });
+    document.getElementById('showThreads').addEventListener('change', requestFrame);
+    engineSelect.addEventListener('change', requestFrame);
+    document.getElementById('resetBtn').addEventListener('click', () => {
+      centerX = -0.5;
+      centerY = 0;
+      scale = 0.0035;
+      requestFrame();
+    });
+  </script>
+</body>
+</html>
