@@ -1,20 +1,17 @@
 (async () => {
   //#region 1: ExternalDependencies
-  window.coi = document.coi = {
-    shouldRegister: () => !window.crossOriginIsolated,
-    shouldDeregister: () => false,
-    coepCredentialless: () => true,
-    coepDegrade: () => true,
-    doReload: () => window.location.reload(),
-    quiet: false,
-    ...window.coi,
-    ...document.coi
+  {
+    const s = Object.assign(document.createElement("script"), { src: "./coi-sw.min.js" });
+    window.coi = document.coi = {
+      quiet: !1,
+      ...window.coi,
+      ...document.coi,
+      ready: new Promise(r => {
+        s.onload = () => r(window.coi.ready),
+        s.onerror = () => r(!1)
+      })
+    }, document.head.appendChild(s)
   };
-  if (!window.crossOriginIsolated && window.isSecureContext && "serviceWorker" in navigator) {
-    const coiScript = document.createElement("script");
-    coiScript.src = "./coi-serviceworker.min.js";
-    document.head.appendChild(coiScript);
-  }
 
   const { fflate, esbuild, Comlink } = await (async () => {
     await new Promise((resolve, reject) => {
@@ -607,6 +604,7 @@
           sendLog("GROUP", [pad() + "▼ " + (a.length ? a.map(v => fmt(v)).join(" ") : "console.group")]);
           groupDepth = Math.min(groupDepth + 1, 10);
         };
+
         console.groupCollapsed = (...a) => {
           sendLog("GROUP", [pad() + "▶ " + (a.length ? a.map(v => fmt(v)).join(" ") : "console.groupCollapsed")]);
           groupDepth = Math.min(groupDepth + 1, 10);
@@ -854,7 +852,7 @@
     const interruptView = interruptBuffer ? new Uint8Array(interruptBuffer) : null;
 
     const PYTHON_BOOT_CODE = String.raw`
-import ast, asyncio, base64, builtins, concurrent.futures as cf, gc, io, js, micropip, os, platform, pyodide, pyodide.code, pyodide.ffi, pyodide_js, re, shutil, sys, time, tokenize, traceback
+import ast, asyncio, base64, builtins, concurrent.futures as cf, gc, importlib, importlib.util, inspect, io, js, micropip, os, platform, pyodide, pyodide.code, pyodide.ffi, pyodide_js, re, shutil, sys, time, tokenize, traceback
 _WORKSPACE_ROOT = "/workspace"
 os.makedirs(_WORKSPACE_ROOT, exist_ok=True); os.chdir(_WORKSPACE_ROOT)
 _ORIG_SLEEP = time.sleep
@@ -863,6 +861,7 @@ _ORIG_CREATE_TASK = asyncio.create_task
 _ORIG_ENSURE_FUTURE = asyncio.ensure_future
 _ORIG_CREATE_PROXY = pyodide.ffi.create_proxy
 _ORIG_CREATE_ONCE = pyodide.ffi.create_once_callable
+_ORIG_MICROPIP_INSTALL = micropip.install
 _BASELINE_MODULES = set(sys.modules.keys())
 _BOOT_TIME = time.perf_counter()
 _stop_requested = False
@@ -872,13 +871,282 @@ _tasks = set()
 _handles = set()
 _proxies = []
 _current_main_task = None
-PKG = {"PIL":"pillow","cv2":"opencv-python","sklearn":"scikit-learn","bs4":"beautifulsoup4","yaml":"pyyaml","pygame":"pygame-ce","turtle":"basthon-turtle"}
+PKG = {
+    "PIL": "pillow",
+    "cv2": "opencv-python",
+    "sklearn": "scikit-learn",
+    "skimage": "scikit-image",
+    "bs4": "beautifulsoup4",
+    "yaml": "pyyaml",
+    "pygame": "pygame-ce",
+    "turtle": "basthon-turtle",
+    "attr": "attrs",
+    "dateutil": "python-dateutil",
+    "dotenv": "python-dotenv",
+    "jwt": "PyJWT",
+    "serial": "pyserial",
+    "websocket": "websocket-client",
+    "Crypto": "pycryptodome",
+    "OpenGL": "PyOpenGL",
+    "docx": "python-docx",
+    "pptx": "python-pptx",
+    "fitz": "PyMuPDF",
+}
+
+def _is_mod_available(mod_name):
+    root = (mod_name or "").split(".")[0]
+    if not root:
+        return False
+    if root in sys.modules or root in sys.builtin_module_names or root in getattr(sys, "stdlib_module_names", ()):
+        return True
+    try:
+        return importlib.util.find_spec(root) is not None
+    except (ImportError, ValueError, AttributeError):
+        return False
+
+def _is_local_mod(mod_name, entry_dir=_WORKSPACE_ROOT):
+    root = (mod_name or "").split(".")[0]
+    if not root:
+        return False
+    for base in (entry_dir, _WORKSPACE_ROOT):
+        if os.path.isfile(os.path.join(base, f"{root}.py")) or os.path.isdir(os.path.join(base, root)):
+            return True
+    return False
+
+async def _patched_micropip_install(requirements, *args, **kwargs):
+    single = isinstance(requirements, str)
+    reqs = [requirements] if single else list(requirements)
+    norm_reqs = []
+    for r in reqs:
+        if isinstance(r, str) and not any(c in r for c in ("/", "\\", ":", "=", "<", ">", "~", "!", "@", "[")) and not r.endswith(".whl"):
+            root = r.split(".")[0]
+            if _is_mod_available(root):
+                continue
+            mapped = PKG.get(root, PKG.get(r, root))
+            if mapped not in norm_reqs:
+                norm_reqs.append(mapped)
+        else:
+            if r not in norm_reqs:
+                norm_reqs.append(r)
+    if not norm_reqs:
+        return None
+    res = await _ORIG_MICROPIP_INSTALL(norm_reqs[0] if single and len(norm_reqs) == 1 else norm_reqs, *args, **kwargs)
+    importlib.invalidate_caches()
+    _apply_compat_shims()
+    return res
+
+micropip.install = _patched_micropip_install
+
+def _apply_compat_shims():
+    # 1. NumPy 2.0 backwards-compatibility aliases
+    if _is_mod_available("numpy"):
+        try:
+            import numpy as np
+            for alias, target in (
+                ("float", float),
+                ("int", int),
+                ("bool", bool),
+                ("object", object),
+                ("str", str),
+                ("unicode", str),
+                ("complex", complex),
+                ("NaN", np.nan),
+                ("Inf", np.inf),
+                ("infty", np.inf),
+                ("alltrue", np.all),
+                ("sometrue", np.any),
+                ("product", np.prod),
+                ("cumproduct", np.cumprod),
+            ):
+                if not hasattr(np, alias):
+                    setattr(np, alias, target)
+            if not hasattr(np, "trapz") and hasattr(np, "trapezoid"):
+                np.trapz = np.trapezoid
+            if not hasattr(np, "in1d") and hasattr(np, "isin"):
+                np.in1d = np.isin
+            if not hasattr(np, "row_stack") and hasattr(np, "vstack"):
+                np.row_stack = np.vstack
+        except Exception:
+            pass
+
+    # 2. filterpy.kalman compatibility (IMMFilter alias & NumPy 2.0 / SciPy vector shape fixes)
+    if _is_mod_available("filterpy"):
+        try:
+            import numpy as np
+            import filterpy.stats
+            import filterpy.kalman
+            from filterpy.kalman import IMMEstimator, KalmanFilter
+
+            if not hasattr(filterpy.kalman, "IMMFilter"):
+                filterpy.kalman.IMMFilter = IMMEstimator
+            if hasattr(filterpy.kalman, "IMM") and not hasattr(filterpy.kalman.IMM, "IMMFilter"):
+                filterpy.kalman.IMM.IMMFilter = IMMEstimator
+            if not hasattr(filterpy.kalman, "MMAEFilter") and hasattr(filterpy.kalman, "MMAEFilterBank"):
+                filterpy.kalman.MMAEFilter = filterpy.kalman.MMAEFilterBank
+            if hasattr(filterpy.kalman, "__all__") and isinstance(filterpy.kalman.__all__, list):
+                for sym in ("IMMFilter", "MMAEFilter"):
+                    if sym not in filterpy.kalman.__all__:
+                        filterpy.kalman.__all__.append(sym)
+
+            if not getattr(filterpy.stats, "_runner_patched", False):
+                filterpy.stats._runner_patched = True
+                _orig_logpdf = filterpy.stats.logpdf
+                def _safe_logpdf(x, mean=None, cov=1, allow_singular=True):
+                    x_arr = np.asarray(x, dtype=float).ravel()
+                    m_arr = np.asarray(mean, dtype=float).ravel() if mean is not None else np.zeros_like(x_arr)
+                    c_arr = np.asarray(cov, dtype=float)
+                    if c_arr.ndim == 2:
+                        c_arr = 0.5 * (c_arr + c_arr.T) + np.eye(c_arr.shape[0]) * 1e-9
+                    try:
+                        val = _orig_logpdf(x_arr, m_arr, c_arr, allow_singular=allow_singular)
+                    except Exception:
+                        diff = x_arr - m_arr
+                        val = -0.5 * float(np.dot(diff, diff))
+                    return float(np.asarray(val).flat[0])
+                filterpy.stats.logpdf = _safe_logpdf
+                if hasattr(filterpy.kalman, "kalman_filter"):
+                    filterpy.kalman.kalman_filter.logpdf = _safe_logpdf
+
+            if not getattr(IMMEstimator, "_runner_patched", False):
+                IMMEstimator._runner_patched = True
+                def _imm_init(self, filters, mu, M):
+                    if len(filters) < 1:
+                        raise ValueError("filters must contain at least one filter")
+                    self.filters = list(filters)
+                    self.N = len(self.filters)
+                    mu_arr = np.asarray(mu, dtype=float).ravel()
+                    mu_sum = float(np.sum(mu_arr))
+                    self.mu = mu_arr / mu_sum if mu_sum > 0 else np.full(self.N, 1.0 / self.N)
+                    self.M = np.asarray(M, dtype=float)
+                    self.x = np.zeros_like(self.filters[0].x, dtype=float)
+                    self.P = np.zeros_like(self.filters[0].P, dtype=float)
+                    self.likelihood = np.zeros(self.N, dtype=float)
+                    self.omega = np.zeros((self.N, self.N), dtype=float)
+                    self._compute_mixing_probabilities()
+                    self._compute_state_estimate()
+                    self.x_prior = self.x.copy()
+                    self.P_prior = self.P.copy()
+                    self.x_post = self.x.copy()
+                    self.P_post = self.P.copy()
+
+                def _imm_mixing(self):
+                    self.cbar = np.maximum(np.dot(self.mu, self.M), 1e-300)
+                    for i in range(self.N):
+                        for j in range(self.N):
+                            self.omega[i, j] = (self.M[i, j] * self.mu[i]) / self.cbar[j]
+                    col_sums = np.sum(self.omega, axis=0, keepdims=True)
+                    col_sums = np.where(col_sums > 0, col_sums, 1.0)
+                    self.omega /= col_sums
+
+                def _imm_state(self):
+                    self.x.fill(0.0)
+                    for f, mu_i in zip(self.filters, self.mu):
+                        self.x += np.asarray(f.x, dtype=float).reshape(self.x.shape) * float(mu_i)
+                    self.P.fill(0.0)
+                    for f, mu_i in zip(self.filters, self.mu):
+                        y = (np.asarray(f.x, dtype=float).reshape(self.x.shape) - self.x).ravel()
+                        self.P += float(mu_i) * (np.outer(y, y) + f.P)
+
+                def _imm_update(self, z, *args, **kwargs):
+                    for i, f in enumerate(self.filters):
+                        f.update(z, *args, **kwargs)
+                        lk = getattr(f, "likelihood", None)
+                        if lk is None:
+                            try:
+                                lk = np.exp(filterpy.stats.logpdf(getattr(f, "y", 0.0), cov=getattr(f, "S", 1.0)))
+                            except Exception:
+                                lk = 1.0
+                        val = float(np.asarray(lk).flat[0])
+                        self.likelihood[i] = val if np.isfinite(val) and val > 1e-300 else 1e-300
+                    self.mu = self.cbar * self.likelihood
+                    total = float(np.sum(self.mu))
+                    if not np.isfinite(total) or total <= 0:
+                        self.mu = np.full(self.N, 1.0 / self.N)
+                    else:
+                        self.mu /= total
+                    self._compute_mixing_probabilities()
+                    self._compute_state_estimate()
+                    self.x_post = self.x.copy()
+                    self.P_post = self.P.copy()
+
+                IMMEstimator.__init__ = _imm_init
+                IMMEstimator._compute_mixing_probabilities = _imm_mixing
+                IMMEstimator._compute_state_estimate = _imm_state
+                IMMEstimator.update = _imm_update
+
+            if hasattr(filterpy.kalman, "EnsembleKalmanFilter"):
+                EnKF = filterpy.kalman.EnsembleKalmanFilter
+                if not getattr(EnKF, "_runner_patched", False):
+                    EnKF._runner_patched = True
+                    _orig_enkf_init = EnKF.__init__
+                    def _enkf_init(self, x, P, dim_z, dt, N, hx, fx):
+                        _orig_enkf_init(self, np.asarray(x, dtype=float).ravel(), P, dim_z, dt, N, hx, fx)
+                    EnKF.__init__ = _enkf_init
+        except Exception:
+            pass
+
+    # 3. py_trees composite default arguments (memory=False, policy=SuccessOnAll)
+    if _is_mod_available("py_trees"):
+        try:
+            import py_trees
+            import py_trees.composites as _ptc
+            import py_trees.common as _pt_common
+            for _cls_name in ("Selector", "Sequence"):
+                _cls = getattr(_ptc, _cls_name, None)
+                if _cls and not getattr(_cls, "_runner_patched", False):
+                    _cls._runner_patched = True
+                    _orig_init = _cls.__init__
+                    def _make_init(orig):
+                        def _patched_init(self, name="Composite", memory=False, children=None, *a, **kw):
+                            if isinstance(memory, (list, tuple)) and children is None:
+                                children, memory = list(memory), False
+                            orig(self, name=name, memory=bool(memory), children=children, *a, **kw)
+                        return _patched_init
+                    _cls.__init__ = _make_init(_orig_init)
+            _par_cls = getattr(_ptc, "Parallel", None)
+            if _par_cls and not getattr(_par_cls, "_runner_patched", False):
+                _par_cls._runner_patched = True
+                _orig_par_init = _par_cls.__init__
+                def _patched_par_init(self, name="Parallel", policy=None, children=None, *a, **kw):
+                    if isinstance(policy, (list, tuple)) and children is None:
+                        children, policy = list(policy), None
+                    if policy is None:
+                        policy = _pt_common.ParallelPolicy.SuccessOnAll()
+                    _orig_par_init(self, name=name, policy=policy, children=children, *a, **kw)
+                _par_cls.__init__ = _patched_par_init
+        except Exception:
+            pass
+
+    # 4. esper 2.x / 3.x World backwards compatibility
+    if _is_mod_available("esper"):
+        try:
+            import esper
+            if not hasattr(esper, "World"):
+                class _EsperWorld:
+                    _counter = 0
+                    def __init__(self, *args, **kwargs):
+                        _EsperWorld._counter += 1
+                        self._name = "default" if _EsperWorld._counter == 1 else f"world_{_EsperWorld._counter}"
+                    def _activate(self):
+                        if getattr(esper, "current_world", None) != self._name and hasattr(esper, "switch_world"):
+                            esper.switch_world(self._name)
+                    def __getattr__(self, attr):
+                        fn = getattr(esper, attr)
+                        if callable(fn):
+                            def _wrapped(*a, **kw):
+                                self._activate()
+                                return fn(*a, **kw)
+                            return _wrapped
+                        return fn
+                esper.World = _EsperWorld
+        except Exception:
+            pass
 
 def _boot_banner():
     py_ver = sys.version.replace("\n", " ")
     arch = f"{platform.system()} {platform.machine()} ({sys.platform})"
     mp_ver = getattr(micropip, "__version__", "builtin")
-    pyodide_ver = getattr(pyodide, "__version__", "0.27.2")
+    pyodide_ver = getattr(pyodide, "__version__", "314.0.7")
     print(f"[CPYTHON] Python {py_ver}")
     print(f"[CPYTHON] Target: {arch} | Pyodide: v{pyodide_ver} | micropip: v{mp_ver}")
     print(f"[CPYTHON] Baseline stdlib modules: {len(_BASELINE_MODULES)} | Recursion limit: {sys.getrecursionlimit()} | GC: {'enabled' if gc.isenabled() else 'disabled'}")
@@ -984,18 +1252,34 @@ def _patch_pygame():
         if getattr(pygame, "_runner_patched", False):
             return
         pygame._runner_patched = True
+        _overlay_cleared = False
 
-        def _guard(fn):
+        def _clear_boot_overlay():
+            nonlocal _overlay_cleared
+            if not _overlay_cleared:
+                _overlay_cleared = True
+                try:
+                    el = js.document.getElementById("o")
+                    if el is not None:
+                        el.textContent = ""
+                except Exception:
+                    pass
+
+        def _guard(fn, clear_ov=False):
             def _w(*a, **k):
                 if _stop_requested:
                     _stop_pygame_audio()
                     raise KeyboardInterrupt("Execution stopped")
+                if clear_ov:
+                    _clear_boot_overlay()
                 return fn(*a, **k)
             return _w
 
         if hasattr(pygame, "display"):
-            pygame.display.flip = _guard(pygame.display.flip)
-            pygame.display.update = _guard(pygame.display.update)
+            if hasattr(pygame.display, "set_mode"):
+                pygame.display.set_mode = _guard(pygame.display.set_mode, True)
+            pygame.display.flip = _guard(pygame.display.flip, True)
+            pygame.display.update = _guard(pygame.display.update, True)
         if hasattr(pygame, "event"):
             pygame.event.get = _guard(pygame.event.get)
             pygame.event.poll = _guard(pygame.event.poll)
@@ -1087,9 +1371,10 @@ async def _run_entry(entry_rel):
     print(f"[ENTRY] Target: {abs_entry} ({line_count} lines, {byte_count} bytes)")
 
     found = sorted(set(pyodide.code.find_imports(code)))
-    local_mods = [p for p in found if os.path.exists(os.path.join(entry_dir, f"{p}.py")) or os.path.exists(os.path.join(_WORKSPACE_ROOT, f"{p}.py"))]
-    preloaded = [p for p in found if p in sys.modules and p not in local_mods]
-    missing = [p for p in found if p not in sys.modules and p not in local_mods]
+    root_imports = sorted({p.split(".")[0] for p in found if p})
+    local_mods = [r for r in root_imports if _is_local_mod(r, entry_dir)]
+    preloaded = [r for r in root_imports if r not in local_mods and _is_mod_available(r)]
+    missing = [r for r in root_imports if r not in local_mods and not _is_mod_available(r)]
 
     print(f"[AST] Imports detected ({len(found)}): {', '.join(found) if found else 'none'}")
     if preloaded:
@@ -1098,27 +1383,30 @@ async def _run_entry(entry_rel):
         print(f"[DEPS] Local workspace modules ({len(local_mods)}): {', '.join(local_mods)}")
 
     if missing and not _stop_requested:
-        t_pkg = time.perf_counter()
         print(f"[DEPS] Resolving external packages ({len(missing)}): {', '.join(missing)}...")
         try:
             await pyodide_js.loadPackagesFromImports("\n".join(f"import {m}" for m in missing))
+            importlib.invalidate_caches()
         except Exception as e:
             print(f"[DEPS] Pyodide package loader note: {e}")
-    for p in missing:
+
+    still_missing = [p for p in missing if not _is_mod_available(p)]
+    for p in still_missing:
         if _stop_requested: break
-        if not sys.modules.get(p):
-            pkg_name = PKG.get(p, p)
-            try:
-                t_mp = time.perf_counter()
-                print(f"[DEPS] Fetching wheel '{pkg_name}' via micropip...")
-                await micropip.install(pkg_name)
-                print(f"[DEPS] Installed '{pkg_name}' in {(time.perf_counter() - t_mp)*1000:.0f}ms")
-            except Exception as e:
-                sys.stderr.write(f"[DEPS] Failed to install '{pkg_name}': {e}\n")
+        pkg_name = PKG.get(p, p)
+        try:
+            t_mp = time.perf_counter()
+            print(f"[DEPS] Fetching wheel '{pkg_name}' via micropip...")
+            await _ORIG_MICROPIP_INSTALL(pkg_name)
+            importlib.invalidate_caches()
+            print(f"[DEPS] Installed '{pkg_name}' in {(time.perf_counter() - t_mp)*1000:.0f}ms")
+        except Exception as e:
+            sys.stderr.write(f"[DEPS] Failed to install '{pkg_name}': {e}\n")
 
     if _stop_requested:
         return None
 
+    _apply_compat_shims()
     _BASELINE_MODULES.update(sys.modules.keys())
     _patch_pygame()
 
@@ -1429,10 +1717,10 @@ async function ensurePy() {
     bootStep("ENV", "Host: " + (navigator.platform || "Web") + " | Threads: " + cores + " | RAM: " + mem + " | COI: " + Boolean(window.crossOriginIsolated));
     bootStep("ENV", "Display: #canvas (" + canvas.width + "x" + canvas.height + ") | 2D: true | WebGL2: " + hasWebGL2 + " | WebAudio: " + Boolean(OrigAudioContext));
     bootStep("ENV", "Interrupts: " + (intBuf ? "SharedArrayBuffer SIGINT (1-byte hardware interrupt)" : "Cooperative async/sleep yield fallback"));
-    bootStep("NET", "Importing Pyodide v0.27.2 ESM bootstrapper from cdn.jsdelivr.net...");
+    bootStep("NET", "Importing Pyodide v314.0.7 ESM bootstrapper from cdn.jsdelivr.net...");
 
     const tImport = performance.now();
-    const { loadPyodide } = await import("https://cdn.jsdelivr.net/pyodide/v0.27.2/full/pyodide.mjs");
+    const { loadPyodide } = await import("https://cdn.jsdelivr.net/pyodide/v314.0.7/full/pyodide.mjs");
     bootStep("NET", "ESM loader fetched in " + (performance.now() - tImport).toFixed(0) + "ms. Downloading & compiling CPython WASM + stdlib...");
 
     const tWasm = performance.now();
@@ -1559,9 +1847,9 @@ Comlink.expose({
     );
 
     function generateStandaloneHtml(entryName, files) {
-      const entryCode = files.find((f) => f.name === entryName)?.content || "";
       const serializedFiles = JSON.stringify(files).replace(/<\/script>/gi, "<\\/script>");
-      return `<!DOCTYPE html><html lang="en" class="bg-zinc-950 text-zinc-100"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>${entryName} - Standalone</title><script src="https://unpkg.com/@tailwindcss/browser@4"><\/script><style type="text/tailwindcss">@import "tailwindcss";</style><script src="https://cdn.jsdelivr.net/pyodide/v0.27.2/full/pyodide.js"><\/script></head><body class="p-4 flex flex-col gap-3 min-h-screen font-mono"><div class="flex items-center justify-between border-b border-zinc-800 pb-2"><h3 class="font-bold text-sm text-blue-400">${entryName}</h3><div id="st" class="text-xs text-zinc-400">Booting Pyodide...</div></div><canvas id="canvas" width="960" height="600" tabindex="1" class="w-full max-h-[70vh] bg-black border border-zinc-800 rounded-lg object-contain"></canvas><pre id="o" class="bg-zinc-900 border border-zinc-800 p-3 rounded-lg text-xs overflow-auto max-h-56 whitespace-pre-wrap"></pre><script>
+      const serializedBoot = JSON.stringify(PYTHON_BOOT_CODE).replace(/<\/script>/gi, "<\\/script>");
+      return `<!DOCTYPE html><html lang="en" class="bg-zinc-950 text-zinc-100"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>${entryName} - Standalone</title><script src="https://unpkg.com/@tailwindcss/browser@4"><\/script><style type="text/tailwindcss">@import "tailwindcss";</style><script src="https://cdn.jsdelivr.net/pyodide/v314.0.7/full/pyodide.js"><\/script></head><body class="p-4 flex flex-col gap-3 min-h-screen font-mono"><div class="flex items-center justify-between border-b border-zinc-800 pb-2"><h3 class="font-bold text-sm text-blue-400">${entryName}</h3><div id="st" class="text-xs text-zinc-400">Booting Pyodide...</div></div><canvas id="canvas" width="960" height="600" tabindex="1" class="w-full max-h-[70vh] bg-black border border-zinc-800 rounded-lg object-contain"></canvas><pre id="o" class="bg-zinc-900 border border-zinc-800 p-3 rounded-lg text-xs overflow-auto max-h-56 whitespace-pre-wrap"></pre><script>
 const st=document.getElementById("st"), o=document.getElementById("o"), canvas=document.getElementById("canvas"), t0=performance.now();
 window.canvas = canvas;
 const print=(m)=>{ o.textContent+=m+"\\n"; o.scrollTop=o.scrollHeight; };
@@ -1569,23 +1857,24 @@ const boot=(tag,m)=>{ const dt="+"+(performance.now()-t0).toFixed(0)+"ms"; st.te
 async function init(){
   try{
     boot("ENV", "Host: "+(navigator.platform||"Web")+" | Cores: "+(navigator.hardwareConcurrency||"n/a")+" | Canvas: "+canvas.width+"x"+canvas.height);
-    boot("WASM", "Initializing Pyodide v0.27.2 WebAssembly runtime...");
+    boot("WASM", "Initializing Pyodide v314.0.7 WebAssembly runtime...");
     const pyodide=await loadPyodide({stdout:print,stderr:print});
-    pyodide.canvas.setCanvas2D(canvas);
-    boot("WASM", "CPython ready ("+pyodide.runPython("import sys; sys.version.split()[0]")+")");
+    pyodide._module.canvas = canvas;
+    pyodide.canvas?.setCanvas2D?.(canvas);
+    pyodide.canvas?.setCanvas3D?.(canvas);
+    boot("PKG", "Loading micropip & runtime hooks...");
+    await pyodide.loadPackage(["micropip"]);
+    pyodide.runPython(${serializedBoot});
     const files=${serializedFiles};
     for(const f of files){
-      const d=f.name.slice(0,f.name.lastIndexOf("/")); if(d) try{pyodide.FS.mkdirTree(d)}catch{}
-      pyodide.FS.writeFile(f.name, f.isBinary ? Uint8Array.from(atob(f.content), x=>x.charCodeAt(0)) : f.content);
+      const full="/workspace/"+f.name;
+      const d=full.slice(0,full.lastIndexOf("/")); if(d) try{pyodide.FS.mkdirTree(d)}catch{}
+      pyodide.FS.writeFile(full, f.isBinary ? Uint8Array.from(atob(f.content), x=>x.charCodeAt(0)) : f.content);
     }
     boot("VFS", "Mounted "+files.length+" workspace file(s)");
-    boot("PKG", "Loading micropip & scanning AST imports...");
-    await pyodide.loadPackage(["micropip"]);
-    try{await pyodide.loadPackagesFromImports(${JSON.stringify(entryCode)})}catch{}
-    boot("EXEC", "Running ${entryName}...");
-    print("─".repeat(60));
     st.textContent="Running ${entryName}...";
-    await pyodide.runPythonAsync("import builtins, js; builtins.canvas = js.document.getElementById('canvas');\\n" + ${JSON.stringify(entryCode)});
+    const fn=pyodide.globals.get("_run_entry");
+    try{ await fn(${JSON.stringify(entryName)}); }finally{ fn.destroy(); }
     st.textContent="Finished.";
   }catch(e){ st.textContent="Error: "+e.message; print("[Error] "+(e.stack||e.message)); }
 }
@@ -1611,21 +1900,18 @@ init();
         name: "HTML Neon Physics & Synth",
         lang: "HTML",
         entry: "index.html",
-        // url: encodeDataUrl("text/html", `<!---->`, "index.html")
         url: "./examples/html/chimes/index.html"
       },
       {
         name: "JavaScript Neon Physics & Synth",
         lang: "JavaScript",
         entry: "main.js",
-        // url: encodeDataUrl("text/javascript", `;`, "main.js")
         url: "./examples/html/chimes/index.html"
       },
       {
         name: "TypeScript Neon Physics & Synth",
         lang: "TypeScript",
         entry: "main.ts",
-        // url: encodeDataUrl("text/typescript", `;`, "main.ts")
         url: encodeDataUrl("text/typescript", 
 `interface Ball {
   x: number;
@@ -1716,7 +2002,6 @@ requestAnimationFrame(loop);
         name: "Python Neon Physics & Synth",
         lang: "Python",
         entry: "main.py",
-        // url: encodeDataUrl("text/x-python", `pass`, "main.py")
         url: encodeDataUrl("text/x-python", 
 `import asyncio, math, random, js
 from pyodide.ffi import create_proxy
