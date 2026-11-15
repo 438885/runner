@@ -1876,7 +1876,7 @@ Comlink.expose({
       const safeEntryJson = safeJson(entryName);
       const serializedFiles = safeJson(files);
       const serializedBoot = safeJson(PYTHON_BOOT_CODE);
-      return `<!DOCTYPE html><html lang="en" class="bg-zinc-950 text-zinc-100"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>${safeTitle} - Standalone</title><script src="https://unpkg.com/@tailwindcss/browser@4"><\/script><style type="text/tailwindcss">@import "tailwindcss";</style></head><body class="p-4 flex flex-col gap-3 min-h-screen font-mono bg-zinc-950 text-zinc-100"><div class="flex items-center justify-between border-b border-zinc-800 pb-2"><h3 class="font-bold text-sm text-blue-400">${safeTitle}</h3><div id="st" class="text-xs text-zinc-400">Booting Pyodide...</div></div><canvas id="canvas" width="960" height="600" tabindex="1" class="w-full max-h-[70vh] bg-black border border-zinc-800 rounded-lg object-contain outline-none"></canvas><pre id="o" class="bg-zinc-900 border border-zinc-800 p-3 rounded-lg text-xs overflow-auto max-h-56 whitespace-pre-wrap"></pre><script type="module">
+      return `<!DOCTYPE html><html lang="en" class="bg-black text-zinc-100"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>${safeTitle} - Standalone</title><script src="https://unpkg.com/@tailwindcss/browser@4"><\/script><style type="text/tailwindcss">@import "tailwindcss";</style><style>*{margin:0;box-sizing:border-box}html,body{width:100vw;height:100vh;overflow:hidden;background:#000;color:#fff}#canvas{position:fixed;inset:0;width:100vw;height:100vh;object-fit:contain;outline:0}#o{position:fixed;inset:0;padding:12px;font:12.5px/1.45 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;overflow:auto;pointer-events:none;text-shadow:0 1px 3px rgba(0,0,0,0.95);color:#e4e4e7;white-space:pre-wrap}</style></head><body class="w-screen h-screen overflow-hidden bg-black text-zinc-100 font-mono"><canvas id="canvas" width="960" height="600" tabindex="-1"></canvas><pre id="o"></pre><div id="st" class="fixed top-2.5 right-3 z-10 px-2.5 py-1 rounded bg-zinc-900/80 border border-zinc-800 text-[11px] text-zinc-300 pointer-events-none backdrop-blur-sm">Booting Pyodide...</div><script type="module">
 const st=document.getElementById("st"), o=document.getElementById("o"), canvas=document.getElementById("canvas"), t0=performance.now();
 window.canvas = canvas;
 window.c = canvas;
@@ -1926,14 +1926,13 @@ async function init(){
       pyodide.FS.writeFile(full, data);
     }
     boot("VFS", "Mounted "+files.length+" workspace file(s)");
-    st.textContent="Running "+${safeEntryJson}+"...";
+    st.style.display="none";
     try{ pyodide.runPython("_prepare_run()"); }catch{}
     canvas.focus();
     const fn=pyodide.globals.get("_run_entry");
     let res;
     try{ res=await fn(${safeEntryJson}); }finally{ if(res&&typeof res.destroy==="function") try{res.destroy();}catch{} fn.destroy(); }
-    st.textContent="Finished.";
-  }catch(e){ st.textContent="Error: "+(e?.message||e); print("[Error] "+(e?.stack||e)); }
+  }catch(e){ st.style.display=""; st.textContent="Error: "+(e?.message||e); print("[Error] "+(e?.stack||e)); }
 }
 init();
 <\/script></body></html>`;
