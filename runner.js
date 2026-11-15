@@ -1370,7 +1370,19 @@ async def _run_entry(entry_rel):
     byte_count = len(code.encode("utf-8"))
     print(f"[ENTRY] Target: {abs_entry} ({line_count} lines, {byte_count} bytes)")
 
-    found = sorted(set(pyodide.code.find_imports(code)))
+    all_found = set(pyodide.code.find_imports(code))
+    for _root, _dirs, _files in os.walk(_WORKSPACE_ROOT):
+        _dirs[:] = [d for d in _dirs if d != "__pycache__" and not d.startswith(".")]
+        for _fn in _files:
+            if _fn.endswith(".py"):
+                _fp = os.path.normpath(os.path.join(_root, _fn))
+                if _fp != abs_entry:
+                    try:
+                        with tokenize.open(_fp) as _sfp:
+                            all_found.update(pyodide.code.find_imports(_sfp.read()))
+                    except Exception:
+                        pass
+    found = sorted(all_found)
     root_imports = sorted({p.split(".")[0] for p in found if p})
     local_mods = [r for r in root_imports if _is_local_mod(r, entry_dir)]
     preloaded = [r for r in root_imports if r not in local_mods and _is_mod_available(r)]
@@ -1408,6 +1420,11 @@ async def _run_entry(entry_rel):
 
     _apply_compat_shims()
     _BASELINE_MODULES.update(sys.modules.keys())
+    if "pygame" in root_imports and _is_mod_available("pygame"):
+        try:
+            import pygame
+        except Exception:
+            pass
     _patch_pygame()
 
     def _ysleep(s=0):
@@ -1839,44 +1856,84 @@ Comlink.expose({
     const prepareFilesForStandalone = (files) => Promise.all(
       files.map(async ({ name, content }) => {
         const isBinary = !FSUtils.TEXT_EXTS.test(name);
-        return {
-          name, isBinary,
-          content: isBinary ? (typeof content === "string" ? btoa(content) : await FSUtils.toBase64(content)) : FSUtils.toStr(content)
-        };
+        if (!isBinary) {
+          return { name, isBinary: false, content: FSUtils.toStr(content) };
+        }
+        const b64 = content instanceof Uint8Array
+          ? FSUtils.toB64(content)
+          : typeof content === "string"
+            ? FSUtils.toB64(new TextEncoder().encode(content))
+            : await FSUtils.toBase64(content);
+        return { name, isBinary: true, content: b64 };
       })
     );
 
+    const escapeHtml = (s = "") => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    const safeJson = (v) => JSON.stringify(v).replace(/</g, "\\u003c").replace(/\u2028/g, "\\u2028").replace(/\u2029/g, "\\u2029");
+
     function generateStandaloneHtml(entryName, files) {
-      const serializedFiles = JSON.stringify(files).replace(/<\/script>/gi, "<\\/script>");
-      const serializedBoot = JSON.stringify(PYTHON_BOOT_CODE).replace(/<\/script>/gi, "<\\/script>");
-      return `<!DOCTYPE html><html lang="en" class="bg-zinc-950 text-zinc-100"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>${entryName} - Standalone</title><script src="https://unpkg.com/@tailwindcss/browser@4"><\/script><style type="text/tailwindcss">@import "tailwindcss";</style><script src="https://cdn.jsdelivr.net/pyodide/v314.0.7/full/pyodide.js"><\/script></head><body class="p-4 flex flex-col gap-3 min-h-screen font-mono"><div class="flex items-center justify-between border-b border-zinc-800 pb-2"><h3 class="font-bold text-sm text-blue-400">${entryName}</h3><div id="st" class="text-xs text-zinc-400">Booting Pyodide...</div></div><canvas id="canvas" width="960" height="600" tabindex="1" class="w-full max-h-[70vh] bg-black border border-zinc-800 rounded-lg object-contain"></canvas><pre id="o" class="bg-zinc-900 border border-zinc-800 p-3 rounded-lg text-xs overflow-auto max-h-56 whitespace-pre-wrap"></pre><script>
+      const safeTitle = escapeHtml(entryName);
+      const safeEntryJson = safeJson(entryName);
+      const serializedFiles = safeJson(files);
+      const serializedBoot = safeJson(PYTHON_BOOT_CODE);
+      return `<!DOCTYPE html><html lang="en" class="bg-zinc-950 text-zinc-100"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>${safeTitle} - Standalone</title><script src="https://unpkg.com/@tailwindcss/browser@4"><\/script><style type="text/tailwindcss">@import "tailwindcss";</style></head><body class="p-4 flex flex-col gap-3 min-h-screen font-mono bg-zinc-950 text-zinc-100"><div class="flex items-center justify-between border-b border-zinc-800 pb-2"><h3 class="font-bold text-sm text-blue-400">${safeTitle}</h3><div id="st" class="text-xs text-zinc-400">Booting Pyodide...</div></div><canvas id="canvas" width="960" height="600" tabindex="1" class="w-full max-h-[70vh] bg-black border border-zinc-800 rounded-lg object-contain outline-none"></canvas><pre id="o" class="bg-zinc-900 border border-zinc-800 p-3 rounded-lg text-xs overflow-auto max-h-56 whitespace-pre-wrap"></pre><script type="module">
 const st=document.getElementById("st"), o=document.getElementById("o"), canvas=document.getElementById("canvas"), t0=performance.now();
 window.canvas = canvas;
-const print=(m)=>{ o.textContent+=m+"\\n"; o.scrollTop=o.scrollHeight; };
+window.c = canvas;
+canvas.onpointerdown = () => canvas.focus();
+const print=(m)=>{ o.append(String(m ?? "") + "\\n"); if (o.textContent.length > 250000) o.textContent = "...[truncated]...\\n" + o.textContent.slice(-200000); o.scrollTop=o.scrollHeight; };
 const boot=(tag,m)=>{ const dt="+"+(performance.now()-t0).toFixed(0)+"ms"; st.textContent="["+tag+"] "+m; print("["+dt+"] ["+tag+"] "+m); };
+async function loadPyodideRuntime(){
+  const urls=[
+    "https://cdn.jsdelivr.net/pyodide/v314.0.7/full/pyodide.mjs",
+    "https://cdn.jsdelivr.net/pyodide/v0.27.5/full/pyodide.mjs"
+  ];
+  let lastErr;
+  for(const u of urls){
+    try{
+      const mod=await import(u);
+      return { loadPyodide: mod.loadPyodide, indexURL: u.slice(0, u.lastIndexOf("/") + 1) };
+    }catch(e){ lastErr=e; }
+  }
+  throw lastErr;
+}
 async function init(){
   try{
     boot("ENV", "Host: "+(navigator.platform||"Web")+" | Cores: "+(navigator.hardwareConcurrency||"n/a")+" | Canvas: "+canvas.width+"x"+canvas.height);
-    boot("WASM", "Initializing Pyodide v314.0.7 WebAssembly runtime...");
-    const pyodide=await loadPyodide({stdout:print,stderr:print});
-    pyodide._module.canvas = canvas;
+    boot("WASM", "Initializing Pyodide WebAssembly runtime...");
+    const { loadPyodide, indexURL }=await loadPyodideRuntime();
+    const pyodide=await loadPyodide({indexURL, stdout:print, stderr:print});
+    if(pyodide._module) pyodide._module.canvas = canvas;
     pyodide.canvas?.setCanvas2D?.(canvas);
     pyodide.canvas?.setCanvas3D?.(canvas);
     boot("PKG", "Loading micropip & runtime hooks...");
     await pyodide.loadPackage(["micropip"]);
     pyodide.runPython(${serializedBoot});
+    try{ pyodide.runPython("_reset_workspace()"); }catch{}
     const files=${serializedFiles};
     for(const f of files){
       const full="/workspace/"+f.name;
       const d=full.slice(0,full.lastIndexOf("/")); if(d) try{pyodide.FS.mkdirTree(d)}catch{}
-      pyodide.FS.writeFile(full, f.isBinary ? Uint8Array.from(atob(f.content), x=>x.charCodeAt(0)) : f.content);
+      let data;
+      if(f.isBinary){
+        const bin=atob(f.content);
+        const u8=new Uint8Array(bin.length);
+        for(let i=0;i<bin.length;i++) u8[i]=bin.charCodeAt(i);
+        data=u8;
+      }else{
+        data=new TextEncoder().encode(f.content);
+      }
+      pyodide.FS.writeFile(full, data);
     }
     boot("VFS", "Mounted "+files.length+" workspace file(s)");
-    st.textContent="Running ${entryName}...";
+    st.textContent="Running "+${safeEntryJson}+"...";
+    try{ pyodide.runPython("_prepare_run()"); }catch{}
+    canvas.focus();
     const fn=pyodide.globals.get("_run_entry");
-    try{ await fn(${JSON.stringify(entryName)}); }finally{ fn.destroy(); }
+    let res;
+    try{ res=await fn(${safeEntryJson}); }finally{ if(res&&typeof res.destroy==="function") try{res.destroy();}catch{} fn.destroy(); }
     st.textContent="Finished.";
-  }catch(e){ st.textContent="Error: "+e.message; print("[Error] "+(e.stack||e.message)); }
+  }catch(e){ st.textContent="Error: "+(e?.message||e); print("[Error] "+(e?.stack||e)); }
 }
 init();
 <\/script></body></html>`;
@@ -2439,28 +2496,28 @@ while True:
     async function exportEntry(target) {
       updateUI(true);
       try {
+        const triggerDownload = (html, fileName) => {
+          const a = Object.assign(document.createElement("a"), {
+            href: URL.createObjectURL(new Blob([html], { type: "text/html" })),
+            download: fileName,
+            style: "display:none"
+          });
+          document.body.appendChild(a);
+          a.click();
+          setTimeout(() => { a.remove(); URL.revokeObjectURL(a.href); }, 1000);
+          Logger.log(`Exported ${fileName} (${(html.length / 1024).toFixed(1)} KB)`, "EXPORT");
+        };
+
         if (FSUtils.isPy(target.name)) {
           Logger.log(`Exporting standalone Python HTML for ${target.name}...`, "EXPORT");
           const html = PythonRuntime.generateStandaloneHtml(target.name, await PythonRuntime.prepareFilesForStandalone(projectFiles));
           const fileName = `${target.name.split("/").pop().replace(/\.[^.]+$/, "") || "py_app"}.standalone.html`;
-          const a = Object.assign(document.createElement("a"), {
-            href: URL.createObjectURL(new Blob([html], { type: "text/html" })),
-            download: fileName
-          });
-          a.click();
-          setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-          Logger.log(`Exported ${fileName} (${(html.length / 1024).toFixed(1)} KB)`, "EXPORT");
+          triggerDownload(html, fileName);
         } else {
           Logger.log(`Exporting standalone JS/TS HTML bundle for ${target.name}...`, "EXPORT");
           const html = await Bundler.buildStandalone(target, projectFiles);
           const fileName = `${target.name.split("/").pop().replace(/\.[^.]+$/, "") || "bundle"}.standalone.html`;
-          const a = Object.assign(document.createElement("a"), {
-            href: URL.createObjectURL(new Blob([html], { type: "text/html" })),
-            download: fileName
-          });
-          a.click();
-          setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-          Logger.log(`Exported ${fileName} (${(html.length / 1024).toFixed(1)} KB)`, "EXPORT");
+          triggerDownload(html, fileName);
         }
       } catch (e) {
         Logger.log(`Export Error: ${e?.stack || e?.message || e}`, "ERR");
@@ -2472,9 +2529,15 @@ while True:
 
     async function execEntry(download = false, explicitEntryName = "") {
       const entryName = explicitEntryName || getSelectedEntryName();
-      const target = projectFiles.find((f) => f.name === entryName) || projectFiles[0];
+      let target = projectFiles.find((f) => f.name === entryName) || projectFiles[0];
       if (!target) return;
-      if (download) return exportEntry(target);
+      if (download) {
+        if (!FSUtils.isRunnable(target.name)) {
+          const fallbackEntry = findDefaultEntry(projectFiles);
+          target = projectFiles.find((f) => f.name === fallbackEntry) || target;
+        }
+        return exportEntry(target);
+      }
 
       await stopExecution(true);
       const runId = ++currentRunId;
