@@ -2109,9 +2109,28 @@ while True:
       }
     ];
 
+    const IGNORED_DIR_NAMES = new Set([
+      "node_modules", ".git", "dist", "build", ".next", "coverage", "out",
+      ".vscode", ".idea", "__pycache__", "__macosx", ".venv", "venv"
+    ]);
+    const PROJECT_MARKER_FILES = new Set([
+      "index.html", "index.htm", "main.py", "app.py", "index.py", "run.py",
+      "main.ts", "index.ts", "main.tsx", "index.tsx", "app.tsx", "main.js", "index.js",
+      "package.json", "tsconfig.json", "pyproject.toml", "requirements.txt"
+    ]);
+    const INTERNAL_PROJECT_SUBDIRS = new Set([
+      "src", "lib", "app", "public", "assets", "static", "styles", "css",
+      "js", "ts", "components", "utils", "helpers", "modules", "scripts",
+      "data", "media", "fonts", "images", "img", "audio", "sounds", "shaders", "models"
+    ]);
+    const ENTRY_PRIORITY = [
+      "index.html", "index.htm", "main.py", "index.tsx", "app.tsx", "main.tsx",
+      "app.py", "index.py", "run.py", "index.ts", "main.ts", "index.js", "main.js"
+    ];
+
     function getBuiltinConfig() {
       const ext = window.BUILTIN_PROJECTS || document.builtinProjects;
-      const folders = ["./projects", "./examples", "./builtin"];
+      const folders = ["./examples", "./projects", "./builtin"];
       const urls = [];
       if (typeof ext === "string") {
         folders.unshift(ext);
@@ -2125,7 +2144,10 @@ while True:
       if (Array.isArray(window.BUILTIN_URLS)) urls.push(...window.BUILTIN_URLS);
       if (typeof window.BUILTIN_FOLDER === "string") folders.unshift(window.BUILTIN_FOLDER);
       urls.push(...DEFAULT_BUILTIN_URLS);
-      return { folders: [...new Set(folders)], urls };
+      const normFolders = folders
+        .filter((f) => typeof f === "string" && f.trim())
+        .map((f) => f.trim().replace(/\/\*+$/, "").replace(/\/+$/, ""));
+      return { folders: [...new Set(normFolders)], urls };
     }
 
     async function extractZipEntries(zipBytesOrFile) {
@@ -2178,6 +2200,23 @@ while True:
       }
     }
 
+    function pickProjectEntry(paths = []) {
+      if (!paths.length) return "";
+      const sorted = [...paths].sort((a, b) => {
+        const da = a.split("/").length, db = b.split("/").length;
+        return da !== db ? da - db : a.localeCompare(b);
+      });
+      for (const cand of ENTRY_PRIORITY) {
+        const exact = sorted.find((p) => p.toLowerCase() === cand);
+        if (exact) return exact;
+      }
+      for (const cand of ENTRY_PRIORITY) {
+        const byBase = sorted.find((p) => p.split("/").at(-1)?.toLowerCase() === cand);
+        if (byBase) return byBase;
+      }
+      return sorted.find((p) => FSUtils.isRunnable(p)) || sorted[0];
+    }
+
     async function fetchRawUrl(url, asText = true) {
       if (url.startsWith("data:")) {
         const withoutHash = url.split("#")[0];
@@ -2225,89 +2264,225 @@ while True:
         const entry = item.entry || (url ? inferFileNameFromUrl(url) : urls?.[0] ? inferFileNameFromUrl(urls[0]) : "");
         const lang = item.lang || FSUtils.detectLangLabel(entry || url || item.name || "");
         const name = item.name || entry || "Project";
+        const resolvedBase = item.baseUrl
+          ? resolveUrl(item.baseUrl)
+          : item.folder
+            ? resolveUrl(item.folder)
+            : baseUrl;
         return {
-          id: item.id || `proj:${name}:${url || (urls ? urls.join(",") : "inline")}`,
+          id: item.id || `proj:${name}:${url || resolvedBase || (urls ? urls[0] : "inline")}`,
           name,
           lang,
           entry,
           url,
           urls,
           files,
-          baseUrl: item.folder ? resolveUrl(item.folder) : baseUrl
+          baseUrl: resolvedBase
         };
       }
       return null;
     }
 
-    async function scanFolderListing(folderUrl) {
-      const cleanFolder = folderUrl.replace(/\/+$/, "");
-      for (const manifestName of ["manifest.json", "index.json", "projects.json"]) {
-        try {
-          const res = await fetch(`${cleanFolder}/${manifestName}`);
-          if (res.ok && (res.headers.get("content-type") || "").includes("json")) {
-            const data = await res.json();
-            const list = Array.isArray(data)
-              ? data
-              : Array.isArray(data?.projects)
-                ? data.projects
-                : Array.isArray(data?.files)
-                  ? data.files
-                  : Object.entries(data || {}).map(([name, val]) => (typeof val === "string" ? { name, url: val } : { name, ...val }));
-            const mapped = list.map((item) => normalizeDescriptor(item, cleanFolder)).filter(Boolean);
-            if (mapped.length) return mapped;
-          }
-        } catch {}
+    async function fetchHtmlDirEntries(dirUrl) {
+      const cleanDir = dirUrl.replace(/\/+$/, "");
+      const res = await fetch(`${cleanDir}/`);
+      if (!res.ok) return null;
+      const ct = res.headers.get("content-type") || "";
+      if (!ct.includes("text/html")) return null;
+      const html = await res.text();
+      const doc = new DOMParser().parseFromString(html, "text/html");
+      const baseResolved = new URL(`${cleanDir}/`, window.location.href);
+      const subdirs = [];
+      const files = [];
+      const seenUrls = new Set();
+
+      for (const a of doc.querySelectorAll("a[href]")) {
+        const rawHref = a.getAttribute("href") || "";
+        if (!rawHref || rawHref.startsWith("?") || rawHref.startsWith("#") || rawHref === "../" || rawHref === "./") continue;
+        let resolved;
+        try { resolved = new URL(rawHref, baseResolved); } catch { continue; }
+        if (!resolved.href.startsWith(baseResolved.href) || resolved.href === baseResolved.href) continue;
+        const rel = decodeURIComponent(resolved.href.slice(baseResolved.href.length));
+        if (!rel || rel.startsWith(".")) continue;
+
+        const cleanRel = rel.replace(/\/+$/, "");
+        const seg = cleanRel.split("/")[0];
+        if (!seg || seg.startsWith(".") || IGNORED_DIR_NAMES.has(seg.toLowerCase())) continue;
+
+        const isDir = rel.endsWith("/")
+          || a.classList.contains("folder")
+          || /\b(?:dir|folder)\b/i.test(a.className || "")
+          || a.textContent.trim().endsWith("/");
+
+        const normHref = isDir ? resolved.href.replace(/\/+$/, "") : resolved.href;
+        if (seenUrls.has(normHref)) continue;
+        seenUrls.add(normHref);
+
+        if (isDir) {
+          subdirs.push({ name: cleanRel, url: normHref });
+        } else if (!cleanRel.endsWith(".DS_Store") && cleanRel !== "Thumbs.db") {
+          files.push({ name: cleanRel, url: resolved.href });
+        }
       }
+      return { subdirs, files, baseHref: baseResolved.href };
+    }
 
+    async function collectAllFilesInProjectDir(dirUrl, visited, depth = 0, maxDepth = 4) {
+      if (depth > maxDepth || visited.has(dirUrl)) return [];
+      visited.add(dirUrl);
+      const listing = await fetchHtmlDirEntries(dirUrl).catch(() => null);
+      if (!listing) return [];
+      const out = listing.files.map((f) => f.url);
+      if (depth < maxDepth && listing.subdirs.length) {
+        const nested = await Promise.all(
+          listing.subdirs.map((sd) => collectAllFilesInProjectDir(sd.url, visited, depth + 1, maxDepth))
+        );
+        for (const arr of nested) out.push(...arr);
+      }
+      return out;
+    }
+
+    async function parseManifestAt(dirUrl, manifestName, relPrefix, depth, maxDepth, visited, allowMapObject = false) {
       try {
-        const res = await fetch(`${cleanFolder}/`);
-        if (!res.ok) return [];
-        const ct = res.headers.get("content-type") || "";
-        if (!ct.includes("text/html")) return [];
-        const html = await res.text();
-        const doc = new DOMParser().parseFromString(html, "text/html");
-        const baseResolved = new URL(`${cleanFolder}/`, window.location.href);
-        const found = [];
-
-        for (const a of doc.querySelectorAll("a[href]")) {
-          const rawHref = a.getAttribute("href") || "";
-          if (!rawHref || rawHref.startsWith("?") || rawHref.startsWith("#") || rawHref === "../" || rawHref === "./") continue;
-          const resolved = new URL(rawHref, baseResolved);
-          if (!resolved.href.startsWith(baseResolved.href) || resolved.href === baseResolved.href) continue;
-          const rel = decodeURIComponent(resolved.href.slice(baseResolved.href.length));
-          if (rel.endsWith("/")) {
-            const subName = rel.replace(/\/+$/, "");
-            if (!subName || subName.startsWith(".")) continue;
-            const subUrl = `${cleanFolder}/${subName}`;
-            const subRes = await fetch(`${subUrl}/`).catch(() => null);
-            if (subRes?.ok && (subRes.headers.get("content-type") || "").includes("text/html")) {
-              const subDoc = new DOMParser().parseFromString(await subRes.text(), "text/html");
-              const subBase = new URL(`${subUrl}/`, window.location.href);
-              const subFiles = [];
-              for (const sa of subDoc.querySelectorAll("a[href]")) {
-                const sh = sa.getAttribute("href") || "";
-                if (!sh || sh.startsWith("?") || sh.startsWith("#") || sh.endsWith("/")) continue;
-                const sr = new URL(sh, subBase);
-                if (sr.href.startsWith(subBase.href)) subFiles.push(sr.href);
-              }
-              if (subFiles.length) {
-                found.push(normalizeDescriptor({ name: subName, urls: subFiles }, subUrl));
-              }
-            }
-          } else if (FSUtils.isRunnable(rel)) {
-            found.push(normalizeDescriptor({ name: rel, url: resolved.href }));
+        const res = await fetch(`${dirUrl}/${manifestName}`);
+        if (!res.ok || !(res.headers.get("content-type") || "").includes("json")) return null;
+        const data = await res.json();
+        const list = Array.isArray(data)
+          ? data
+          : Array.isArray(data?.projects)
+            ? data.projects
+            : Array.isArray(data?.examples)
+              ? data.examples
+              : Array.isArray(data?.files)
+                ? data.files
+                : (allowMapObject && data && typeof data === "object" && !data.icons && !data.short_name)
+                  ? Object.entries(data).map(([name, val]) => (typeof val === "string" ? { name, url: val } : { name, ...val }))
+                  : null;
+        if (!list?.length) return null;
+        const out = [];
+        for (const item of list) {
+          if (typeof item === "string" && item.endsWith("/")) {
+            const subName = item.replace(/^\/+|\/+$/g, "");
+            const subRel = relPrefix ? `${relPrefix}/${subName}` : subName;
+            out.push(...await scanDirRecursive(`${dirUrl}/${subName}`, subRel, depth + 1, maxDepth, visited));
+          } else {
+            const desc = normalizeDescriptor(item, dirUrl);
+            if (desc) out.push(desc);
           }
         }
-        return found.filter(Boolean);
+        return out.length ? out : null;
       } catch {
-        return [];
+        return null;
       }
+    }
+
+    async function scanDirRecursive(dirUrl, relPrefix = "", depth = 0, maxDepth = 4, visited = new Set()) {
+      const cleanDir = dirUrl.replace(/\/+$/, "");
+      if (depth > maxDepth || visited.has(cleanDir)) return [];
+      visited.add(cleanDir);
+
+      if (depth === 0) {
+        for (const mName of ["manifest.json", "index.json", "projects.json"]) {
+          const fromManifest = await parseManifestAt(cleanDir, mName, relPrefix, depth, maxDepth, visited, true);
+          if (fromManifest) return fromManifest;
+        }
+      }
+
+      const listing = await fetchHtmlDirEntries(cleanDir).catch(() => null);
+      if (!listing) return [];
+
+      const { subdirs, files, baseHref } = listing;
+      const runnableFiles = files.filter((f) => FSUtils.isRunnable(f.name));
+      const zipFiles = runnableFiles.filter((f) => FSUtils.isZip(f.name));
+      const nonZipRunnable = runnableFiles.filter((f) => !FSUtils.isZip(f.name));
+      const hasProjectMarker = files.some((f) => PROJECT_MARKER_FILES.has(f.name.toLowerCase()));
+      const allSubdirsInternal = subdirs.length > 0 && subdirs.every((sd) => INTERNAL_PROJECT_SUBDIRS.has(sd.name.toLowerCase()));
+
+      if (depth >= 1 && !hasProjectMarker && !nonZipRunnable.length) {
+        const manifestFile = files.find((f) => /^(?:manifest|index|projects)\.json$/i.test(f.name));
+        if (manifestFile) {
+          const fromManifest = await parseManifestAt(cleanDir, manifestFile.name, relPrefix, depth, maxDepth, visited, false);
+          if (fromManifest) return fromManifest;
+        }
+      }
+
+      const isProjectRoot = depth >= 1 && (
+        hasProjectMarker ||
+        (nonZipRunnable.length > 0 && (subdirs.length === 0 || allSubdirsInternal))
+      );
+
+      if (isProjectRoot) {
+        const projectFileUrls = files.map((f) => f.url);
+        for (const sd of subdirs) {
+          projectFileUrls.push(...await collectAllFilesInProjectDir(sd.url, visited, depth + 1, maxDepth));
+        }
+        const relPaths = projectFileUrls.map((u) => {
+          const r = new URL(u, window.location.href).href;
+          return r.startsWith(baseHref) ? decodeURIComponent(r.slice(baseHref.length)) : inferFileNameFromUrl(u);
+        });
+        const entry = pickProjectEntry(relPaths);
+        const projName = relPrefix || cleanDir.split("/").pop() || "Project";
+        const desc = normalizeDescriptor({
+          name: projName,
+          entry,
+          urls: projectFileUrls
+        }, cleanDir);
+        return desc ? [desc] : [];
+      }
+
+      const found = [];
+      for (const f of zipFiles) {
+        const projName = relPrefix ? `${relPrefix}/${f.name}` : f.name;
+        const desc = normalizeDescriptor({ name: projName, url: f.url }, cleanDir);
+        if (desc) found.push(desc);
+      }
+      for (const f of nonZipRunnable) {
+        const projName = relPrefix ? `${relPrefix}/${f.name}` : f.name;
+        const desc = normalizeDescriptor({ name: projName, url: f.url }, cleanDir);
+        if (desc) found.push(desc);
+      }
+      if (depth < maxDepth) {
+        const subResults = await Promise.all(
+          subdirs.map((sd) => {
+            const nextPrefix = relPrefix ? `${relPrefix}/${sd.name}` : sd.name;
+            return scanDirRecursive(sd.url, nextPrefix, depth + 1, maxDepth, visited);
+          })
+        );
+        for (const arr of subResults) found.push(...arr);
+      }
+      return found;
+    }
+
+    async function scanFolderListing(folderUrl) {
+      return scanDirRecursive(folderUrl);
     }
 
     async function discoverBuiltins() {
       const { folders, urls } = getBuiltinConfig();
       const folderResults = (await Promise.all(folders.map(scanFolderListing))).flat();
-      const urlResults = urls.map((u) => normalizeDescriptor(u)).filter(Boolean);
+      const discoveredFileUrls = new Set();
+      for (const item of folderResults) {
+        if (item.url) {
+          try { discoveredFileUrls.add(new URL(item.url, window.location.href).href); } catch {}
+        }
+        if (Array.isArray(item.urls)) {
+          for (const u of item.urls) {
+            try { discoveredFileUrls.add(new URL(u, window.location.href).href); } catch {}
+          }
+        }
+      }
+      const urlResults = urls
+        .map((u) => normalizeDescriptor(u))
+        .filter((item) => {
+          if (!item) return false;
+          if (item.url && !item.url.startsWith("data:")) {
+            try {
+              const abs = new URL(item.url, window.location.href).href;
+              if (discoveredFileUrls.has(abs)) return false;
+            } catch {}
+          }
+          return true;
+        });
       const seen = new Set();
       return [...folderResults, ...urlResults].filter((item) => {
         if (!item || seen.has(item.id)) return false;
@@ -2317,11 +2492,27 @@ while True:
     }
 
     async function loadProjectFiles(project) {
-      if (Array.isArray(project.files) && project.files.length && project.files[0].content !== undefined) {
-        return project.files.map((f) => ({
-          name: FSUtils.sanitizePath(f.name),
-          content: f.content
-        })).filter((f) => f.name);
+      if (Array.isArray(project.files) && project.files.length) {
+        if (project.files[0]?.content !== undefined) {
+          return project.files.map((f) => ({
+            name: FSUtils.sanitizePath(f.name),
+            content: f.content
+          })).filter((f) => f.name);
+        }
+        const resolvedBase = project.baseUrl ? `${project.baseUrl.replace(/\/+$/, "")}/` : "";
+        const loaded = await Promise.all(
+          project.files.map(async (f) => {
+            const rawName = typeof f === "string" ? f : f.name;
+            const rawUrl = typeof f === "string"
+              ? (resolvedBase ? `${resolvedBase}${f.replace(/^\.?\//, "")}` : f)
+              : (f.url || (resolvedBase ? `${resolvedBase}${rawName.replace(/^\.?\//, "")}` : rawName));
+            const fileName = FSUtils.sanitizePath(rawName || inferFileNameFromUrl(rawUrl, project.entry || "main.js"));
+            if (!fileName) return null;
+            const content = await fetchRawUrl(rawUrl, FSUtils.TEXT_EXTS.test(fileName));
+            return { name: fileName, content };
+          })
+        );
+        return loaded.filter(Boolean);
       }
 
       if (project.url && FSUtils.isZip(inferFileNameFromUrl(project.url))) {
@@ -2335,9 +2526,20 @@ while True:
           ? [project.url]
           : [];
 
+      const baseHref = project.baseUrl
+        ? new URL(`${project.baseUrl.replace(/\/+$/, "")}/`, window.location.href).href
+        : "";
+
       const fetched = await Promise.all(
         targetUrls.map(async (u) => {
-          const fileName = FSUtils.sanitizePath(inferFileNameFromUrl(u, project.entry || "main.js"));
+          let relName = "";
+          if (baseHref) {
+            try {
+              const abs = new URL(u, window.location.href).href;
+              if (abs.startsWith(baseHref)) relName = decodeURIComponent(abs.slice(baseHref.length));
+            } catch {}
+          }
+          const fileName = FSUtils.sanitizePath(relName || inferFileNameFromUrl(u, project.entry || "main.js"));
           const isText = FSUtils.TEXT_EXTS.test(fileName);
           const content = await fetchRawUrl(u, isText);
           return { name: fileName, content };
@@ -2348,12 +2550,16 @@ while True:
         const htmlContent = FSUtils.toStr(fetched[0].content);
         const doc = new DOMParser().parseFromString(htmlContent, "text/html");
         const base = new URL(targetUrls[0], window.location.href);
+        const existing = new Set(fetched.map((f) => f.name));
         const linked = [];
         for (const el of doc.querySelectorAll("script[src], link[rel~='stylesheet'][href]")) {
           const ref = el.getAttribute("src") || el.getAttribute("href");
           if (!ref || /^(?:https?:|data:|blob:|\/\/)/i.test(ref)) continue;
           const relName = FSUtils.sanitizePath(ref);
-          if (relName) linked.push({ relName, url: new URL(ref, base).href });
+          if (relName && !existing.has(relName)) {
+            existing.add(relName);
+            linked.push({ relName, url: new URL(ref, base).href });
+          }
         }
         const extras = await Promise.all(
           linked.map(async ({ relName, url }) => {
