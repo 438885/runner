@@ -1,0 +1,3629 @@
+<!--
+===============================================================================
+PyWASM — Minimal Python-to-WebAssembly (WASM + SIMD) AST Compiler
+===============================================================================
+
+1. WHAT THIS APPLICATION IS:
+   PyWASM is a self-contained, single-file browser application powered by Pyodide,
+   SolidJS 2.0, and Tailwind CSS v4 that compiles standard Python syntax directly into
+   native WebAssembly (.wasm) bytecode, including 128-bit 4-wide SIMD (v128) vector
+   instructions, directly in the browser without requiring external offline toolchains.
+   It integrates in-browser symbolic AST optimization (sympy), static Def-Use dataflow
+   analysis (gast, beniget), source-to-bytecode line mapping (asttokens), vectorized
+   C-buffer memory views (numpy), property-based kernel fuzzing (hypothesis), binary
+   validation (wabt), -O3 SIMD binary optimization (binaryen), CodeMirror 6 editors
+   (@codemirror/view, @codemirror/lang-python, @codemirror/lang-wast), and off-thread
+   Web Worker execution (comlink).
+
+2. WHAT IT DOES:
+   - Compiles Python functions decorated with `@mod.kernel` into standalone
+     WebAssembly modules.
+   - Performs static AST Def-Use analysis (`beniget` / `gast` dead-store and
+     loop-invariant detection) and algebraic polynomial simplification / Horner
+     factoring (`sympy`) prior to opcode emission.
+   - Outputs portable Base64-encoded `.wasm` binaries, section-by-section byte
+     breakdowns, and downloadable `.wasm` files alongside a 3-mode CodeMirror 6
+     WAT disassembler (`PyWASM + asttokens Line Map`, `WABT Standard WAT`, and
+     `Binaryen -O3 WAT`) with `wabt` binary validation and one-click `binaryen`
+     `-O3` binary hot-swapping.
+   - Manages shared linear memory between Python and WebAssembly using typed
+     arrays (`MemoryArray`), 4-wide SIMD views (`arr.v128[...]`), named scalar
+     telemetry slots (`StructOut`), and NumPy-vectorized C-buffer Structure-of-Arrays
+     arenas (`SoAArena`) with zero-copy `memoryview` and `np.frombuffer` synchronization.
+   - Provides an interactive runner for invoking compiled WASM exports on the main
+     thread, benchmarking 100-run averages off-thread in a `Comlink` Web Worker, or
+     running property-based determinism and finiteness fuzz testing via `hypothesis`.
+   - Includes a filterable Compiler & Execution Log console, line-accurate
+     `WasmASTCompileError` diagnostics with CodeMirror inline error badges and
+     Jump-to-Line navigation, plus an interactive `Expr` stack-bytecode, `SymPy`
+     Common Subexpression Elimination (CSE), and LEB128 encoding inspector.
+
+3. HOW IT WORKS:
+   - LEB128, Binary Emitter & Section Profiler (Regions 1 & 6): Encodes WebAssembly
+     Type (0x01), Function (0x03), Memory (0x05), Export (0x07), and Code (0x0A)
+     sections directly in Python `bytearray` buffers using unsigned/signed LEB128,
+     recording per-section byte sizes and structured compiler log events.
+   - Typed Stack Expressions (Region 2): The `Expr` and `LocalVar` classes
+     overload Python operators (`+`, `-`, `*`, `/`, `%`, `&`, `|`, `^`, `~`, `<<`,
+     `>>`, `<`, `<=`, `>`, `>=`) to emit type-appropriate WASM opcodes (`i32`,
+     `f32`, or `v128` SIMD) onto the function's instruction stream.
+   - Python AST Compiler, Symbolic Lowering & Static Analysis (Regions 4 & 5):
+     `_ASTKernelCompiler` (an `ast.NodeVisitor`) parses Python functions via
+     `inspect.getsourcelines` + `ast.parse` + `asttokens.ASTTokens`, runs `gast`
+     and `beniget` `DefUseChains` / `UseDefChains` analysis, rewrites scalar
+     polynomial arithmetic subtrees via `sympy.simplify` and `sympy.horner`, and
+     translates annotated locals, `for i in range(...)`, `while`, `if/else`,
+     `break`, `continue`, and ternary `a if cond else b` (`select`) into structured
+     WebAssembly blocks (`block`, `loop`, `br`, `br_if`, `if/else/end`). Compile-time
+     boolean flags (such as `if use_simd:`) are statically evaluated to dead-strip
+     unused branches, and every emitted instruction offset is mapped back to its
+     originating Python source line.
+   - Shared Memory, NumPy Vectorization & Instantiation (Regions 3, 6 & 7):
+     `WasmModule.instantiate()` compiles the emitted bytes via the browser's
+     `WebAssembly.Instance` API and binds `Float32Array` / `Int32Array` views over
+     `exports.mem.buffer` at 16-byte aligned offsets. `SoAArena` wraps its C-buffers
+     with zero-copy `np.frombuffer` views and vectorizes 4-wide spatial bounding-box
+     chunk reductions via `np.minimum.reduceat` and `np.maximum.reduceat`.
+   - Disassembler, Diagnostics, Fuzzing & Frontend Bridge (Regions 8–12):
+     `disassemble_code()` decodes scalar and `0xFD` SIMD opcodes alongside `asttokens`
+     source-line spans; `_build_error_report()` extracts exact line/column caret
+     excerpts and filtered tracebacks; `run_hypothesis_fuzz()` executes property-based
+     checks over generated `i32`/`f32` strategies; and the SolidJS 2.0 frontend
+     coordinates CodeMirror 6 editors (with per-line emitted WASM byte/op badges),
+     `wabt` validation, `binaryen` `-O3` optimization, and `Comlink` Web Worker RPC.
+===============================================================================
+-->
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PyWASM — Compiler</title>
+  <script type="importmap">
+    {
+      "imports": {
+        "@solidjs/signals": "https://esm.sh/@solidjs/signals@2.0.0-rc.23",
+        "@solidjs/signals/": "https://esm.sh/@solidjs/signals@2.0.0-rc.23/",
+        "solid-js": "https://esm.sh/solid-js@2.0.0-rc.23?external=@solidjs/signals",
+        "solid-js/internal": "https://esm.sh/solid-js@2.0.0-rc.23/internal?external=@solidjs/signals,solid-js",
+        "solid-js/": "https://esm.sh/solid-js@2.0.0-rc.23/",
+        "@solidjs/web": "https://esm.sh/@solidjs/web@2.0.0-rc.23?external=solid-js,@solidjs/signals",
+        "@solidjs/web/": "https://esm.sh/@solidjs/web@2.0.0-rc.23/",
+        "@solidjs/html": "https://esm.sh/@solidjs/html@2.0.0-rc.23?external=solid-js,@solidjs/web,@solidjs/signals",
+        "@codemirror/state": "https://esm.sh/@codemirror/state@6.7.6",
+        "@codemirror/view": "https://esm.sh/@codemirror/view@6.43.15?external=@codemirror/state",
+        "@codemirror/language": "https://esm.sh/@codemirror/language@6.13.1?external=@codemirror/state,@codemirror/view",
+        "@codemirror/commands": "https://esm.sh/@codemirror/commands@6.11.1?external=@codemirror/state,@codemirror/view,@codemirror/language",
+        "@codemirror/lang-python": "https://esm.sh/@codemirror/lang-python@6.2.1?external=@codemirror/state,@codemirror/view,@codemirror/language",
+        "@codemirror/lang-wast": "https://esm.sh/@codemirror/lang-wast@6.0.2?external=@codemirror/state,@codemirror/view,@codemirror/language",
+        "binaryen": "https://esm.sh/binaryen@132.0.0",
+        "wabt": "https://esm.sh/wabt@1.0.39",
+        "comlink": "https://esm.sh/comlink@4.4.2"
+      }
+    }
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+  <script src="https://cdn.jsdelivr.net/pyodide/v314.0.8/full/pyodide.js"></script>
+  <style type="text/tailwindcss">
+    @import "tailwindcss";
+
+    @theme inline {
+      --color-bg: var(--bg);
+      --color-fg: var(--fg);
+      --color-border: var(--border);
+      --color-muted-bg: var(--muted-bg);
+      --font-mono: monospace;
+    }
+
+    :root {
+      --bg: #ffffff;
+      --fg: #000000;
+      --border: #000000;
+      --muted-bg: #f5f5f5;
+      --err-bg: #fff0f0;
+      --err-border: #cc0000;
+      --err-fg: #990000;
+      --warn-fg: #8a5a00;
+      --ok-fg: #006622;
+    }
+    :root.dark,
+    body.dark {
+      --bg: #111111;
+      --fg: #e5e5e5;
+      --border: #555555;
+      --muted-bg: #1a1a1a;
+      --err-bg: #2a1215;
+      --err-border: #ff5555;
+      --err-fg: #ff8888;
+      --warn-fg: #f0c674;
+      --ok-fg: #7ec699;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: monospace;
+      font-size: 13px;
+      line-height: 1.4;
+      margin: 12px;
+      background: var(--bg);
+      color: var(--fg);
+    }
+    h1, h2, h3 { margin: 0 0 6px 0; font-size: 14px; font-weight: bold; }
+    p { margin: 0 0 8px 0; }
+    textarea, input, button, select {
+      font-family: monospace;
+      font-size: 13px;
+      line-height: normal;
+      padding: 4px 6px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--fg);
+    }
+    button, select { cursor: pointer; }
+    button:hover, select:hover { background: var(--muted-bg); }
+    button:disabled { opacity: 0.4; cursor: default; }
+    textarea { width: 100%; tab-size: 4; line-height: 1.4; background: var(--muted-bg); }
+    pre {
+      font-family: monospace;
+      font-size: 13px;
+      line-height: 1.4;
+      margin: 4px 0;
+      padding: 6px;
+      border: 1px solid var(--border);
+      background: var(--muted-bg);
+      color: var(--fg);
+      white-space: pre-wrap;
+      word-break: break-word;
+      overflow-x: auto;
+    }
+    fieldset {
+      border: 1px solid var(--border);
+      padding: 8px;
+      margin: 0 0 10px 0;
+      min-width: 0;
+      background: var(--bg);
+    }
+    fieldset.error-box {
+      border-color: var(--err-border);
+      background: var(--err-bg);
+    }
+    legend { font-weight: bold; padding: 0 4px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 4px; }
+    th, td { border: 1px solid var(--border); padding: 3px 6px; text-align: left; vertical-align: top; }
+    th { background: var(--muted-bg); font-weight: bold; }
+
+    /* Dedicated two-column layout immune to Tailwind .grid utility collisions */
+    .layout-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 12px;
+      align-items: start;
+      width: 100%;
+    }
+    .layout-col {
+      min-width: 0;
+      width: 100%;
+    }
+    .bar {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      flex-wrap: wrap;
+      margin-bottom: 8px;
+    }
+    .cm-host-py {
+      border: 1px solid var(--border);
+      background: var(--muted-bg);
+      height: 460px;
+      overflow: hidden;
+    }
+    .cm-host-wat {
+      border: 1px solid var(--border);
+      background: var(--muted-bg);
+      height: 310px;
+      overflow: hidden;
+    }
+    .cm-editor {
+      height: 100%;
+      background: var(--muted-bg);
+      color: var(--fg);
+    }
+    .cm-scroller {
+      font-family: monospace !important;
+      font-size: 13px !important;
+      line-height: 1.4 !important;
+      overflow: auto !important;
+    }
+    .cm-gutters {
+      background: var(--bg) !important;
+      color: var(--fg) !important;
+      border-right: 1px solid var(--border) !important;
+      opacity: 0.75;
+    }
+    .cm-wasm-badge {
+      display: inline-block;
+      margin-left: 12px;
+      padding: 0 4px;
+      font-size: 11px;
+      opacity: 0.7;
+      border: 1px solid var(--border);
+      background: var(--bg);
+    }
+    .cm-error-line {
+      background: var(--err-bg) !important;
+      border-left: 3px solid var(--err-border);
+    }
+    .cm-error-badge {
+      display: inline-block;
+      margin-left: 12px;
+      padding: 0 5px;
+      font-size: 11px;
+      font-weight: bold;
+      color: var(--err-fg);
+      border: 1px solid var(--err-border);
+      background: var(--err-bg);
+    }
+    .log-console {
+      max-height: 220px;
+      overflow-y: auto;
+      border: 1px solid var(--border);
+      background: var(--muted-bg);
+      padding: 4px 6px;
+      font-size: 12px;
+    }
+    .log-entry {
+      padding: 2px 0;
+      border-bottom: 1px dotted rgba(128, 128, 128, 0.25);
+      display: flex;
+      gap: 6px;
+      align-items: baseline;
+    }
+    .log-entry:last-child { border-bottom: none; }
+    .log-lvl-ERROR { color: var(--err-fg); font-weight: bold; }
+    .log-lvl-WARN { color: var(--warn-fg); }
+    .log-lvl-PASS, .log-lvl-OPT { color: var(--ok-fg); }
+    @media (max-width: 960px) {
+      .layout-grid { grid-template-columns: minmax(0, 1fr); }
+    }
+  </style>
+</head>
+<body class="dark">
+  <div id="app"></div>
+
+  <!-- ===================================================================== -->
+  <!-- CORE PYTHON-TO-WASM AST COMPILER                                      -->
+  <!-- ===================================================================== -->
+  <script id="python-compiler-lib" type="text/python">
+import ast
+import inspect
+import linecache
+import math
+import struct
+import textwrap
+import traceback
+from array import array
+from contextlib import contextmanager
+
+try:
+    import js
+    HAS_JS = True
+except ImportError:
+    HAS_JS = False
+
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    np = None
+    HAS_NUMPY = False
+
+try:
+    import sympy
+    HAS_SYMPY = True
+except ImportError:
+    sympy = None
+    HAS_SYMPY = False
+
+try:
+    import asttokens
+    HAS_ASTTOKENS = True
+except ImportError:
+    asttokens = None
+    HAS_ASTTOKENS = False
+
+try:
+    import gast
+    import beniget
+    HAS_BENIGET = True
+except ImportError:
+    gast = None
+    beniget = None
+    HAS_BENIGET = False
+
+try:
+    import hypothesis
+    from hypothesis import given, settings, HealthCheck, strategies as st
+    HAS_HYPOTHESIS = True
+except ImportError:
+    hypothesis = None
+    HAS_HYPOTHESIS = False
+
+# region 1 wasm_types_and_leb128
+I32, I64, F32, F64, V128 = 0x7F, 0x7E, 0x7D, 0x7C, 0x7B
+TYPE_MAP = {"i32": I32, "i64": I64, "f32": F32, "f64": F64, "v128": V128, "byte_offset": I32}
+ITEM_SIZE = {"i32": 4, "i64": 8, "f32": 4, "f64": 8, "v128": 16}
+
+_ACTIVE_FN: "FuncBuilder | None" = None
+_COMPILER_LOGS: list[dict] = []
+
+
+def log_compiler_event(level: str, phase: str, message: str, line: int | None = None):
+    _COMPILER_LOGS.append({
+        "level": level,
+        "phase": phase,
+        "message": message,
+        "line": line,
+    })
+
+
+def leb128_u(v: int) -> bytes:
+    out = bytearray()
+    while True:
+        b = v & 0x7F
+        v >>= 7
+        if v:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return bytes(out)
+
+
+def leb128_s(v: int) -> bytes:
+    v &= 0xFFFFFFFF
+    if v >= 0x80000000:
+        v -= 0x100000000
+    out = bytearray()
+    while True:
+        b = v & 0x7F
+        v >>= 7
+        if (v == 0 and (b & 0x40) == 0) or (v == -1 and (b & 0x40) != 0):
+            out.append(b)
+            return bytes(out)
+        out.append(b | 0x80)
+
+
+def encode_section(sec_id: int, payload: bytes) -> bytes:
+    return bytes([sec_id]) + leb128_u(len(payload)) + payload
+# endregion
+
+
+# region 2 typed_wasm_expressions_and_simd_intrinsics
+class Expr:
+    def __init__(self, code: bytes, vtype: int, is_byte_offset: bool = False):
+        self.code = bytes(code)
+        self.vtype = vtype
+        self.is_byte_offset = is_byte_offset
+
+    def _coerce(self, other) -> "Expr":
+        if isinstance(other, Expr):
+            return other
+        if isinstance(other, (int, bool)) and self.vtype == I32:
+            return i32(int(other))
+        if isinstance(other, (int, float)) and self.vtype == F32:
+            return f32(float(other))
+        if isinstance(other, (int, float)) and self.vtype == V128:
+            return f32(float(other)).splat()
+        raise TypeError(f"Cannot coerce {other!r} to WASM type {hex(self.vtype)}")
+
+    def _binop(self, other, op_i32=None, op_f32=None, op_v128=None, out_type=None) -> "Expr":
+        rhs = self._coerce(other)
+        t = self.vtype
+        op = {I32: op_i32, F32: op_f32, V128: op_v128}.get(t)
+        if op is None:
+            raise TypeError(f"Unsupported operation for WASM type {hex(t)}")
+        return Expr(self.code + rhs.code + op, out_type or t)
+
+    def __add__(self, o): return self._binop(o, b"\x6A", b"\x92", b"\xFD\xE4\x01")
+    def __radd__(self, o): return self._coerce(o).__add__(self)
+    def __sub__(self, o): return self._binop(o, b"\x6B", b"\x93", b"\xFD\xE5\x01")
+    def __rsub__(self, o): return self._coerce(o).__sub__(self)
+    def __mul__(self, o): return self._binop(o, b"\x6C", b"\x94", b"\xFD\xE6\x01")
+    def __rmul__(self, o): return self._coerce(o).__mul__(self)
+    def __truediv__(self, o): return self._binop(o, b"\x6D", b"\x95", b"\xFD\xE7\x01")
+    def __rtruediv__(self, o): return self._coerce(o).__truediv__(self)
+    def __mod__(self, o): return self._binop(o, b"\x6F")
+    def __neg__(self):
+        if self.vtype == F32: return Expr(self.code + b"\x8C", F32)
+        if self.vtype == V128: return Expr(self.code + b"\xFD\xE1\x01", V128)
+        return i32(0) - self
+
+    def __and__(self, o): return self._binop(o, b"\x71", None, b"\xFD\x4E")
+    def __or__(self, o):  return self._binop(o, b"\x72", None, b"\xFD\x50")
+    def __xor__(self, o): return self._binop(o, b"\x73", None, b"\xFD\x51")
+    def __invert__(self):
+        if self.vtype == V128: return Expr(self.code + b"\xFD\x4D", V128)
+        return self ^ i32(-1)
+    def __lshift__(self, o): return self._binop(o, b"\x74")
+    def __rshift__(self, o): return self._binop(o, b"\x75")
+    def shr_u(self, o):      return self._binop(o, b"\x76")
+
+    def __lt__(self, o): return self._binop(o, b"\x48", b"\x5D", b"\xFD\x43", I32 if self.vtype != V128 else V128)
+    def __gt__(self, o): return self._binop(o, b"\x4A", b"\x5E", b"\xFD\x44", I32 if self.vtype != V128 else V128)
+    def __le__(self, o): return self._binop(o, b"\x4C", b"\x5F", b"\xFD\x45", I32 if self.vtype != V128 else V128)
+    def __ge__(self, o): return self._binop(o, b"\x4E", b"\x60", b"\xFD\x46", I32 if self.vtype != V128 else V128)
+    def eq(self, o):     return self._binop(o, b"\x46", b"\x5B", b"\xFD\x41", I32 if self.vtype != V128 else V128)
+    def ne(self, o):     return self._binop(o, b"\x47", b"\x5C", b"\xFD\x42", I32 if self.vtype != V128 else V128)
+    def lt_u(self, o):   return self._binop(o, b"\x49", out_type=I32)
+    def gt_u(self, o):   return self._binop(o, b"\x4B", out_type=I32)
+    def le_u(self, o):   return self._binop(o, b"\x4D", out_type=I32)
+    def ge_u(self, o):   return self._binop(o, b"\x4F", out_type=I32)
+
+    def eqz(self) -> "Expr": return Expr(self.code + b"\x45", I32)
+    def abs(self) -> "Expr": return Expr(self.code + ({F32: b"\x8B", V128: b"\xFD\xE0\x01"}[self.vtype]), self.vtype)
+    def sqrt(self) -> "Expr": return Expr(self.code + ({F32: b"\x91", V128: b"\xFD\xE3\x01"}[self.vtype]), self.vtype)
+    def floor(self) -> "Expr": return Expr(self.code + ({F32: b"\x8E", V128: b"\xFD\x67"}[self.vtype]), self.vtype)
+    def ceil(self) -> "Expr": return Expr(self.code + ({F32: b"\x8D", V128: b"\xFD\x66"}[self.vtype]), self.vtype)
+    def min(self, o) -> "Expr": return self._binop(o, None, b"\x96", b"\xFD\xEC\x01")
+    def max(self, o) -> "Expr": return self._binop(o, None, b"\x97", b"\xFD\xED\x01")
+    def clamp(self, lo, hi) -> "Expr": return self.max(lo).min(hi)
+
+    def to_f32(self) -> "Expr": return Expr(self.code + b"\xB2", F32)
+    def to_i32(self) -> "Expr": return Expr(self.code + b"\xA8", I32)
+    def bitcast_f32(self) -> "Expr": return Expr(self.code + b"\xBE", F32)
+    def bitcast_i32(self) -> "Expr": return Expr(self.code + b"\xBC", I32)
+
+    def splat(self) -> "Expr":
+        op = {F32: b"\xFD\x13", I32: b"\xFD\x11"}[self.vtype]
+        return Expr(self.code + op, V128)
+
+    def any_true(self) -> "Expr": return Expr(self.code + b"\xFD\x53", I32)
+    def all_true(self) -> "Expr": return Expr(self.code + b"\xFD\xA3\x01", I32)
+
+
+def i32(val: int) -> Expr:
+    return Expr(b"\x41" + leb128_s(int(val)), I32)
+
+
+def f32(val: float) -> Expr:
+    return Expr(b"\x43" + struct.pack("<f", float(val)), F32)
+
+
+def byte_offset(index_expr) -> Expr:
+    if isinstance(index_expr, Expr) and index_expr.is_byte_offset:
+        return index_expr
+    expr = index_expr if isinstance(index_expr, Expr) else i32(index_expr)
+    return Expr((expr << 2).code, I32, is_byte_offset=True)
+
+
+def select(cond: Expr, true_val, false_val) -> Expr:
+    t_expr = true_val if isinstance(true_val, Expr) else f32(true_val)
+    f_expr = t_expr._coerce(false_val)
+    return Expr(t_expr.code + f_expr.code + cond.code + b"\x1B", t_expr.vtype)
+
+
+def murmur_hash32(seed: Expr, idx: Expr) -> Expr:
+    h = seed ^ (idx * i32(0xC2B2AE3D))
+    h = (h ^ h.shr_u(16)) * i32(0x7FEB352D)
+    h = (h ^ h.shr_u(15)) * i32(0x846CA68B)
+    return h ^ h.shr_u(16)
+
+
+class LocalVar(Expr):
+    def __init__(self, fn: "FuncBuilder", name: str, idx: int, vtype: int, is_byte_offset: bool = False):
+        super().__init__(b"\x20" + leb128_u(idx), vtype, is_byte_offset=is_byte_offset)
+        self.fn = fn
+        self.name = name
+        self.idx = idx
+
+    def set(self, val):
+        if isinstance(val, Expr) and val.is_byte_offset:
+            self.is_byte_offset = True
+        expr = self._coerce(val)
+        self.fn._emit(expr.code + b"\x21" + leb128_u(self.idx))
+
+    def tee(self, val) -> Expr:
+        if isinstance(val, Expr) and val.is_byte_offset:
+            self.is_byte_offset = True
+        expr = self._coerce(val)
+        return Expr(expr.code + b"\x22" + leb128_u(self.idx), self.vtype, is_byte_offset=self.is_byte_offset)
+# endregion
+
+
+# region 3 declarative_arrays_simd_views_and_struct_out
+class SimdArrayView:
+    def __init__(self, arr: "MemoryArray"):
+        self.arr = arr
+
+    def __getitem__(self, index) -> Expr:
+        addr_code, static_off = self.arr._addr(index)
+        return Expr(addr_code + b"\xFD\x00\x02" + leb128_u(static_off), V128)
+
+    def __setitem__(self, index, val: Expr):
+        if _ACTIVE_FN is None:
+            raise RuntimeError("SIMD store must occur inside a WASM function builder or @kernel.")
+        addr_code, static_off = self.arr._addr(index)
+        _ACTIVE_FN._emit(addr_code + val.code + b"\xFD\x0B\x02" + leb128_u(static_off))
+
+
+class MemoryArray:
+    def __init__(self, module: "WasmModule", name: str, dtype: str, capacity: int, byte_offset: int):
+        self.module = module
+        self.name = name
+        self.dtype = dtype
+        self.vtype = TYPE_MAP[dtype]
+        self.capacity = capacity
+        self.byte_offset = byte_offset
+        self.byte_length = capacity * ITEM_SIZE[dtype]
+        self.v128 = SimdArrayView(self)
+
+    def _addr(self, index) -> tuple[bytes, int]:
+        if isinstance(index, int):
+            return i32(0).code, self.byte_offset + (index << 2)
+        if isinstance(index, Expr) and index.is_byte_offset:
+            return index.code, self.byte_offset
+        idx_expr = index if isinstance(index, Expr) else i32(index)
+        return (idx_expr << 2).code, self.byte_offset
+
+    def __getitem__(self, index) -> Expr:
+        addr_code, static_off = self._addr(index)
+        load_op = b"\x28\x02" if self.vtype == I32 else b"\x2A\x02"
+        return Expr(addr_code + load_op + leb128_u(static_off), self.vtype)
+
+    def __setitem__(self, index, val):
+        if _ACTIVE_FN is None:
+            raise RuntimeError("Array assignment `arr[i] = val` must be inside an active WASM function.")
+        _ACTIVE_FN.store(self, index, val)
+
+
+class StructOut:
+    def __init__(self, arr: MemoryArray, fields: list[str]):
+        object.__setattr__(self, "_arr", arr)
+        object.__setattr__(self, "_fields", {name: idx for idx, name in enumerate(fields)})
+        object.__setattr__(self, "_runtime_view", None)
+
+    def _bind_runtime(self, view):
+        object.__setattr__(self, "_runtime_view", view)
+
+    def __getattr__(self, name: str):
+        fields = object.__getattribute__(self, "_fields")
+        if name not in fields:
+            raise AttributeError(f"No field '{name}' in StructOut")
+        idx = fields[name]
+        if _ACTIVE_FN is not None:
+            return object.__getattribute__(self, "_arr")[idx]
+        view = object.__getattribute__(self, "_runtime_view")
+        return view[idx]
+
+    def __setattr__(self, name: str, val):
+        fields = object.__getattribute__(self, "_fields")
+        if name not in fields:
+            raise AttributeError(f"No field '{name}' in StructOut")
+        idx = fields[name]
+        if _ACTIVE_FN is not None:
+            _ACTIVE_FN.store(object.__getattribute__(self, "_arr"), idx, val)
+        else:
+            view = object.__getattribute__(self, "_runtime_view")
+            view[idx] = val
+
+    def unpack(self, *field_names: str) -> tuple:
+        view = object.__getattribute__(self, "_runtime_view")
+        fields = object.__getattribute__(self, "_fields")
+        names = field_names or list(fields.keys())
+        return tuple(float(view[fields[n]]) if object.__getattribute__(self, "_arr").dtype == "f32" else int(view[fields[n]]) for n in names)
+
+    def to_dict(self) -> dict:
+        fields = object.__getattribute__(self, "_fields")
+        vals = self.unpack(*fields.keys())
+        return dict(zip(fields.keys(), vals))
+# endregion
+
+
+# region 4 structured_function_builder
+class ControlLabel:
+    def __init__(self, depth: int):
+        self.depth = depth
+
+
+class FuncBuilder:
+    def __init__(self, name: str, ret_type: str | None = "i32"):
+        self.name = name
+        self.ret_type = TYPE_MAP[ret_type] if ret_type else None
+        self.params: list[int] = []
+        self.param_names: list[str] = []
+        self.locals: list[int] = []
+        self.named_vars: dict[str, LocalVar] = {}
+        self.code = bytearray()
+        self._depth = 0
+        self._prev_fn = None
+        # asttokens source-line tracking & sympy/beniget metadata
+        self._current_line: int | None = None
+        self._current_col: int | None = None
+        self._current_src: str = ""
+        self.line_spans: list[tuple[int, int, int, str]] = []
+        self.sympy_rewrites: list[dict] = []
+        self.beniget_report: dict = {}
+        self.py_fn = None
+
+    def __enter__(self) -> "FuncBuilder":
+        global _ACTIVE_FN
+        self._prev_fn = _ACTIVE_FN
+        _ACTIVE_FN = self
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        global _ACTIVE_FN
+        _ACTIVE_FN = self._prev_fn
+
+    def param(self, name: str, dtype: str = "i32") -> LocalVar:
+        if self.locals:
+            raise RuntimeError("Declare all parameters before locals.")
+        vtype = TYPE_MAP[dtype]
+        idx = len(self.params)
+        self.params.append(vtype)
+        self.param_names.append(name)
+        var = LocalVar(self, name, idx, vtype, is_byte_offset=(dtype == "byte_offset"))
+        self.named_vars[name] = var
+        return var
+
+    def local(self, name: str, dtype: str = "i32", init=None) -> LocalVar:
+        if name in self.named_vars:
+            var = self.named_vars[name]
+            if init is not None:
+                var.set(init)
+            return var
+        if dtype not in TYPE_MAP:
+            raise TypeError(f"Unknown WASM local type annotation '{dtype}' for variable '{name}'. Expected one of: {list(TYPE_MAP.keys())}")
+        vtype = TYPE_MAP[dtype]
+        idx = len(self.params) + len(self.locals)
+        self.locals.append(vtype)
+        is_bo = (dtype == "byte_offset") or (isinstance(init, Expr) and init.is_byte_offset)
+        var = LocalVar(self, name, idx, vtype, is_byte_offset=is_bo)
+        self.named_vars[name] = var
+        if init is not None:
+            var.set(init)
+        return var
+
+    def _emit(self, raw: bytes):
+        start_off = len(self.code)
+        self.code.extend(raw)
+        end_off = len(self.code)
+        if self._current_line is not None and end_off > start_off:
+            self.line_spans.append((start_off, end_off, self._current_line, self._current_src))
+
+    def store(self, arr: MemoryArray, index, val):
+        addr_code, static_off = arr._addr(index)
+        val_expr = val if isinstance(val, Expr) else (i32(val) if arr.vtype == I32 else f32(float(val)))
+        store_op = b"\x36\x02" if arr.vtype == I32 else b"\x38\x02"
+        self._emit(addr_code + val_expr.code + store_op + leb128_u(static_off))
+
+    @contextmanager
+    def block(self):
+        lbl = ControlLabel(self._depth)
+        self._depth += 1
+        self._emit(b"\x02\x40")
+        try:
+            yield lbl
+        finally:
+            self._depth -= 1
+            self._emit(b"\x0B")
+
+    @contextmanager
+    def loop(self):
+        lbl = ControlLabel(self._depth)
+        self._depth += 1
+        self._emit(b"\x03\x40")
+        try:
+            yield lbl
+        finally:
+            self._depth -= 1
+            self._emit(b"\x0B")
+
+    @contextmanager
+    def while_loop(self, cond: Expr | None = None):
+        with self.block() as brk, self.loop() as cont:
+            if cond is not None:
+                self.br_if(cond.eqz(), brk)
+            yield brk, cont
+            self.br(cont)
+
+    @contextmanager
+    def if_(self, cond: Expr):
+        self._emit(cond.code + b"\x04\x40")
+        self._depth += 1
+        try:
+            yield
+        finally:
+            self._depth -= 1
+            self._emit(b"\x0B")
+
+    def else_(self):
+        self._emit(b"\x05")
+
+    def _rel_depth(self, label: ControlLabel) -> int:
+        rel = self._depth - label.depth - 1
+        if rel < 0:
+            raise ValueError("Target label is out of scope.")
+        return rel
+
+    def br(self, label: ControlLabel):
+        self._emit(b"\x0C" + leb128_u(self._rel_depth(label)))
+
+    def br_if(self, cond: Expr, label: ControlLabel):
+        self._emit(cond.code + b"\x0D" + leb128_u(self._rel_depth(label)))
+
+    def ret(self, val=None):
+        if val is not None:
+            expr = val if isinstance(val, Expr) else (i32(val) if self.ret_type == I32 else f32(float(val)))
+            self._emit(expr.code)
+        self._emit(b"\x0F")
+
+    def encode_signature(self) -> bytes:
+        res = bytes([1, self.ret_type]) if self.ret_type else b"\x00"
+        return bytes([0x60]) + leb128_u(len(self.params)) + bytes(self.params) + res
+
+    def encode_body(self) -> bytes:
+        runs = []
+        for ltype in self.locals:
+            if runs and runs[-1][1] == ltype:
+                runs[-1][0] += 1
+            else:
+                runs.append([1, ltype])
+        loc_bytes = bytearray(leb128_u(len(runs)))
+        for count, ltype in runs:
+            loc_bytes.extend(leb128_u(count) + bytes([ltype]))
+        tail = b""
+        if not self.code or self.code[-1] != 0x0F:
+            if self.ret_type == I32:
+                tail = i32(0).code
+            elif self.ret_type == F32:
+                tail = f32(0.0).code
+        body = bytes(loc_bytes) + bytes(self.code) + tail + b"\x0B"
+        return leb128_u(len(body)) + body
+# endregion
+
+
+# region 5 python_ast_to_wasm_compiler_with_sympy_beniget_asttokens
+class WasmASTCompileError(SyntaxError):
+    """Structured AST-to-WASM compilation exception carrying exact source coordinates."""
+    def __init__(self, message: str, kernel_name: str, lineno: int | None = None, col_offset: int | None = None, src_text: str = ""):
+        super().__init__(message)
+        self.message = message
+        self.kernel_name = kernel_name
+        self.lineno = lineno
+        self.col_offset = col_offset
+        self.src_text = src_text
+
+
+def analyze_ast_with_beniget(tree: ast.Module, fn_name: str, start_line_offset: int = 0) -> dict:
+    """Static Def-Use and Use-Def analysis powered by `gast` and `beniget`."""
+    if not HAS_BENIGET:
+        return {"enabled": False}
+    try:
+        gmod = gast.ast_to_gast(tree)
+        duc = beniget.DefUseChains()
+        duc.visit(gmod)
+        udc = beniget.UseDefChains(duc)
+
+        gfn = gmod.body[0]
+        defs_summary = []
+        dead_locals = []
+        param_names = {arg.id for arg in gfn.args.args}
+        seen_symbols = {}
+
+        for node, d in duc.chains.items():
+            if node is gfn:
+                continue
+            name = getattr(node, "id", getattr(node, "name", None))
+            if not name or name == fn_name:
+                continue
+            use_count = len(d.users())
+            line_no = getattr(node, "lineno", 1) + start_line_offset
+            if name not in seen_symbols:
+                seen_symbols[name] = {
+                    "symbol": name,
+                    "uses": use_count,
+                    "is_param": name in param_names,
+                    "line": line_no,
+                }
+            else:
+                seen_symbols[name]["uses"] += use_count
+
+        for name, info in seen_symbols.items():
+            defs_summary.append(info)
+            if info["uses"] == 0 and not info["is_param"]:
+                dead_locals.append(name)
+                log_compiler_event(
+                    "WARN",
+                    "BENIGET",
+                    f"Kernel '{fn_name}': Local variable '{name}' is assigned at L{info['line']} but never read (dead store).",
+                    line=info["line"],
+                )
+
+        loop_invariant_uses = []
+        for child in gast.walk(gfn):
+            if isinstance(child, (gast.For, gast.While)):
+                loop_nodes = set(gast.walk(child))
+                for ln in loop_nodes:
+                    if isinstance(ln, gast.Name) and isinstance(ln.ctx, gast.Load):
+                        defs_of_use = udc.chains.get(ln, [])
+                        if defs_of_use and all(df.node not in loop_nodes for df in defs_of_use):
+                            if ln.id not in loop_invariant_uses and ln.id not in ("range", "min", "max", "abs", "splat", "byte_offset", "sqrt"):
+                                loop_invariant_uses.append(ln.id)
+
+        log_compiler_event(
+            "INFO",
+            "BENIGET",
+            f"Kernel '{fn_name}': Analyzed {len(defs_summary)} symbols ({len(dead_locals)} dead locals, {len(loop_invariant_uses)} loop-invariant symbols).",
+            line=getattr(gfn, "lineno", 1) + start_line_offset,
+        )
+
+        return {
+            "enabled": True,
+            "defs": defs_summary,
+            "dead_locals": dead_locals,
+            "loop_invariants": loop_invariant_uses,
+        }
+    except Exception as exc:
+        log_compiler_event("WARN", "BENIGET", f"Beniget analysis warning: {exc}")
+        return {"enabled": False, "error": str(exc)}
+
+
+def _ast_to_sympy_poly(node: ast.AST, sym_map: dict, vtypes: set):
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+        if isinstance(node.value, float):
+            vtypes.add(F32)
+            return sympy.Float(node.value)
+        vtypes.add(I32)
+        return sympy.Integer(node.value)
+    if isinstance(node, ast.Name) and node.id in sym_map:
+        sym, vt = sym_map[node.id]
+        if vt == V128:
+            return None
+        vtypes.add(vt)
+        return sym
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        inner = _ast_to_sympy_poly(node.operand, sym_map, vtypes)
+        return -inner if inner is not None else None
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult)):
+        l_sym = _ast_to_sympy_poly(node.left, sym_map, vtypes)
+        r_sym = _ast_to_sympy_poly(node.right, sym_map, vtypes)
+        if l_sym is None or r_sym is None:
+            return None
+        if isinstance(node.op, ast.Add):
+            return l_sym + r_sym
+        if isinstance(node.op, ast.Sub):
+            return l_sym - r_sym
+        if isinstance(node.op, ast.Mult):
+            return l_sym * r_sym
+    return None
+
+
+def _sympy_to_ast(expr, is_float: bool) -> ast.AST:
+    if expr.is_Symbol:
+        return ast.Name(id=str(expr), ctx=ast.Load())
+    if expr.is_Number:
+        val = float(expr) if is_float else int(expr)
+        if val < 0:
+            return ast.UnaryOp(op=ast.USub(), operand=ast.Constant(value=-val))
+        return ast.Constant(value=val)
+    if expr.is_Add:
+        args = list(expr.args)
+        cur = _sympy_to_ast(args[0], is_float)
+        for a in args[1:]:
+            if a.is_Mul and a.args[0].is_Number and float(a.args[0]) < 0:
+                pos_mul = -a
+                cur = ast.BinOp(left=cur, op=ast.Sub(), right=_sympy_to_ast(pos_mul, is_float))
+            else:
+                cur = ast.BinOp(left=cur, op=ast.Add(), right=_sympy_to_ast(a, is_float))
+        return cur
+    if expr.is_Mul:
+        args = list(expr.args)
+        if args[0] == -1:
+            rest = sympy.Mul(*args[1:]) if len(args) > 2 else args[1]
+            return ast.UnaryOp(op=ast.USub(), operand=_sympy_to_ast(rest, is_float))
+        cur = _sympy_to_ast(args[0], is_float)
+        for a in args[1:]:
+            cur = ast.BinOp(left=cur, op=ast.Mult(), right=_sympy_to_ast(a, is_float))
+        return cur
+    if expr.is_Pow and expr.args[1].is_Integer and 1 <= int(expr.args[1]) <= 4:
+        base_ast = _sympy_to_ast(expr.args[0], is_float)
+        exp_n = int(expr.args[1])
+        cur = base_ast
+        for _ in range(exp_n - 1):
+            cur = ast.BinOp(left=cur, op=ast.Mult(), right=base_ast)
+        return cur
+    raise ValueError("Unsupported SymPy node for AST lowering")
+
+
+class _ASTKernelCompiler(ast.NodeVisitor):
+    def __init__(self, fn: FuncBuilder, env: dict, atok=None, start_line_offset: int = 0):
+        self.fn = fn
+        self.env = env
+        self.atok = atok
+        self.start_line_offset = start_line_offset
+        self.loop_stack: list[tuple[ControlLabel, ControlLabel]] = []
+
+    def _track_node(self, node: ast.AST):
+        lineno = getattr(node, "lineno", None)
+        col = getattr(node, "col_offset", None)
+        if lineno is not None:
+            self.fn._current_line = lineno + self.start_line_offset
+        if col is not None:
+            self.fn._current_col = col
+        if self.atok is not None and lineno is not None:
+            try:
+                txt = self.atok.get_text(node).strip().splitlines()[0]
+                self.fn._current_src = txt[:56]
+            except Exception:
+                pass
+
+    def visit(self, node: ast.AST):
+        self._track_node(node)
+        try:
+            return super().visit(node)
+        except WasmASTCompileError:
+            raise
+        except Exception as exc:
+            raise WasmASTCompileError(
+                message=f"{type(exc).__name__}: {exc}",
+                kernel_name=self.fn.name,
+                lineno=self.fn._current_line,
+                col_offset=self.fn._current_col,
+                src_text=self.fn._current_src,
+            ) from exc
+
+    def _try_sympy_rewrite(self, node: ast.BinOp) -> ast.AST:
+        if not HAS_SYMPY or not isinstance(node.op, (ast.Add, ast.Sub, ast.Mult)):
+            return node
+        sym_map = {
+            name: (sympy.Symbol(name, real=True), var.vtype)
+            for name, var in self.fn.named_vars.items()
+            if var.vtype in (I32, F32) and not var.is_byte_offset
+        }
+        vtypes = set()
+        sym_expr = _ast_to_sympy_poly(node, sym_map, vtypes)
+        if sym_expr is None or len(vtypes) != 1:
+            return node
+        try:
+            orig_ops = int(sympy.count_ops(sym_expr))
+            if orig_ops < 2:
+                return node
+            simplified = sympy.simplify(sym_expr)
+            if len(simplified.free_symbols) == 1:
+                simplified = sympy.horner(simplified)
+            new_ops = int(sympy.count_ops(simplified))
+            if new_ops < orig_ops or str(simplified) != str(sym_expr):
+                is_float = (F32 in vtypes)
+                rewritten_ast = _sympy_to_ast(simplified, is_float=is_float)
+                orig_str = ast.unparse(node) if hasattr(ast, "unparse") else str(sym_expr)
+                new_str = ast.unparse(rewritten_ast) if hasattr(ast, "unparse") else str(simplified)
+                if orig_str != new_str:
+                    ops_saved = max(0, orig_ops - new_ops)
+                    self.fn.sympy_rewrites.append({
+                        "line": self.fn._current_line,
+                        "original": orig_str,
+                        "simplified": new_str,
+                        "ops_saved": ops_saved,
+                    })
+                    log_compiler_event(
+                        "OPT",
+                        "SYMPY",
+                        f"Kernel '{self.fn.name}' L{self.fn._current_line}: Rewrote `{orig_str}` -> `{new_str}`",
+                        line=self.fn._current_line,
+                    )
+                return rewritten_ast
+        except Exception:
+            pass
+        return node
+
+    def eval_expr(self, node: ast.AST, allow_sympy: bool = True):
+        self._track_node(node)
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, bool):
+                return i32(int(node.value))
+            if isinstance(node.value, int):
+                return i32(node.value)
+            if isinstance(node.value, float):
+                return f32(node.value)
+            raise SyntaxError(f"Unsupported constant literal {node.value!r} (only int, float, bool are allowed in WASM kernels)")
+
+        if isinstance(node, ast.Name):
+            if node.id in self.fn.named_vars:
+                return self.fn.named_vars[node.id]
+            if node.id in self.env:
+                val = self.env[node.id]
+                if isinstance(val, int) and not isinstance(val, bool):
+                    return i32(val)
+                if isinstance(val, float):
+                    return f32(val)
+                return val
+            known = list(self.fn.named_vars.keys())
+            raise NameError(f"Unknown variable or symbol '{node.id}' in WASM kernel '{self.fn.name}'. Locals in scope: {known}")
+
+        if isinstance(node, ast.UnaryOp):
+            operand = self.eval_expr(node.operand, allow_sympy=allow_sympy)
+            if isinstance(node.op, ast.USub):
+                return -operand
+            if isinstance(node.op, ast.Not):
+                return operand.eqz() if isinstance(operand, Expr) else (not operand)
+            if isinstance(node.op, ast.Invert):
+                return ~operand
+
+        if isinstance(node, ast.BinOp):
+            if allow_sympy:
+                rewritten = self._try_sympy_rewrite(node)
+                if rewritten is not node:
+                    return self.eval_expr(rewritten, allow_sympy=False)
+            left = self.eval_expr(node.left, allow_sympy=False)
+            right = self.eval_expr(node.right, allow_sympy=False)
+            op_map = {
+                ast.Add: lambda a, b: a + b,
+                ast.Sub: lambda a, b: a - b,
+                ast.Mult: lambda a, b: a * b,
+                ast.Div: lambda a, b: a / b,
+                ast.Mod: lambda a, b: a % b,
+                ast.BitAnd: lambda a, b: a & b,
+                ast.BitOr: lambda a, b: a | b,
+                ast.BitXor: lambda a, b: a ^ b,
+                ast.LShift: lambda a, b: a << b,
+                ast.RShift: lambda a, b: a >> b,
+            }
+            for op_cls, fn_op in op_map.items():
+                if isinstance(node.op, op_cls):
+                    return fn_op(left, right)
+
+        if isinstance(node, ast.BoolOp):
+            vals = [self.eval_expr(v) for v in node.values]
+            res = vals[0]
+            for v in vals[1:]:
+                res = (res & v) if isinstance(node.op, ast.And) else (res | v)
+            return res
+
+        if isinstance(node, ast.Compare):
+            left = self.eval_expr(node.left)
+            res = None
+            cur = left
+            for op, comp in zip(node.ops, node.comparators):
+                rhs = self.eval_expr(comp)
+                if isinstance(op, ast.Lt): c = cur < rhs
+                elif isinstance(op, ast.LtE): c = cur <= rhs
+                elif isinstance(op, ast.Gt): c = cur > rhs
+                elif isinstance(op, ast.GtE): c = cur >= rhs
+                elif isinstance(op, ast.Eq): c = cur.eq(rhs)
+                elif isinstance(op, ast.NotEq): c = cur.ne(rhs)
+                else: raise SyntaxError(f"Unsupported comparison operator: {type(op).__name__}")
+                res = c if res is None else (res & c)
+                cur = rhs
+            return res
+
+        if isinstance(node, ast.IfExp):
+            cond = self.eval_expr(node.test)
+            t_val = self.eval_expr(node.body)
+            f_val = self.eval_expr(node.orelse)
+            return select(cond, t_val, f_val)
+
+        if isinstance(node, ast.Subscript):
+            target = self.eval_expr(node.value)
+            idx = self.eval_expr(node.slice)
+            return target[idx]
+
+        if isinstance(node, ast.Attribute):
+            obj = self.eval_expr(node.value)
+            return getattr(obj, node.attr)
+
+        if isinstance(node, ast.Call):
+            func = self.eval_expr(node.func)
+            args = [self.eval_expr(a) for a in node.args]
+            if func is min and len(args) == 2: return args[0].min(args[1])
+            if func is max and len(args) == 2: return args[0].max(args[1])
+            if func is abs and len(args) == 1: return args[0].abs()
+            return func(*args)
+
+        raise SyntaxError(f"Unsupported Python AST node '{type(node).__name__}' in WASM kernel: {ast.dump(node)}")
+
+    def _try_static_bool(self, test_node: ast.AST) -> bool | None:
+        if isinstance(test_node, ast.Name) and test_node.id not in self.fn.named_vars and test_node.id in self.env:
+            val = self.env[test_node.id]
+            if isinstance(val, bool):
+                return val
+        if isinstance(test_node, ast.UnaryOp) and isinstance(test_node.op, ast.Not):
+            inner = self._try_static_bool(test_node.operand)
+            if inner is not None:
+                return not inner
+        return None
+
+    def visit_Assign(self, node: ast.Assign):
+        if len(node.targets) != 1:
+            raise SyntaxError("Multiple assignment targets not supported in WASM kernel.")
+        target = node.targets[0]
+        val = self.eval_expr(node.value)
+
+        if isinstance(target, ast.Name):
+            if target.id in self.fn.named_vars:
+                self.fn.named_vars[target.id].set(val)
+            else:
+                vtype_name = {I32: "i32", F32: "f32", V128: "v128"}[val.vtype]
+                if getattr(val, "is_byte_offset", False):
+                    vtype_name = "byte_offset"
+                self.fn.local(target.id, vtype_name, init=val)
+        elif isinstance(target, ast.Subscript):
+            arr = self.eval_expr(target.value)
+            idx = self.eval_expr(target.slice)
+            arr[idx] = val
+        elif isinstance(target, ast.Attribute):
+            obj = self.eval_expr(target.value)
+            setattr(obj, target.attr, val)
+        else:
+            raise SyntaxError(f"Unsupported assignment target: {ast.dump(target)}")
+
+    def visit_AnnAssign(self, node: ast.AnnAssign):
+        if not isinstance(node.target, ast.Name) or not isinstance(node.annotation, ast.Name):
+            raise SyntaxError("Annotated local must be `name: type = val` (e.g. `x: f32 = 0.0`)")
+        dtype = node.annotation.id
+        init_val = self.eval_expr(node.value) if node.value is not None else None
+        self.fn.local(node.target.id, dtype, init=init_val)
+
+    def visit_AugAssign(self, node: ast.AugAssign):
+        bin_node = ast.BinOp(
+            left=node.target,
+            op=node.op,
+            right=node.value,
+            lineno=getattr(node, "lineno", 1),
+            col_offset=getattr(node, "col_offset", 0),
+        )
+        assign_node = ast.Assign(
+            targets=[node.target],
+            value=bin_node,
+            lineno=getattr(node, "lineno", 1),
+            col_offset=getattr(node, "col_offset", 0),
+        )
+        self.visit_Assign(assign_node)
+
+    def visit_If(self, node: ast.If):
+        static_eval = self._try_static_bool(node.test)
+        if static_eval is True:
+            for stmt in node.body:
+                self.visit(stmt)
+            return
+        if static_eval is False:
+            for stmt in node.orelse:
+                self.visit(stmt)
+            return
+
+        cond = self.eval_expr(node.test)
+        with self.fn.if_(cond):
+            for stmt in node.body:
+                self.visit(stmt)
+            if node.orelse:
+                self.fn.else_()
+                for stmt in node.orelse:
+                    self.visit(stmt)
+
+    def visit_While(self, node: ast.While):
+        is_while_true = isinstance(node.test, ast.Constant) and node.test.value in (True, 1)
+        with self.fn.block() as brk, self.fn.loop() as cont:
+            if not is_while_true:
+                cond = self.eval_expr(node.test)
+                self.fn.br_if(cond.eqz(), brk)
+            self.loop_stack.append((brk, cont))
+            try:
+                for stmt in node.body:
+                    self.visit(stmt)
+            finally:
+                self.loop_stack.pop()
+            self.fn.br(cont)
+
+    def visit_For(self, node: ast.For):
+        if not (isinstance(node.iter, ast.Call) and isinstance(node.iter.func, ast.Name) and node.iter.func.id == "range"):
+            raise SyntaxError("Only `for i in range(...)` loops are supported in WASM kernels.")
+        args = [self.eval_expr(a) for a in node.iter.args]
+        step_const = 1
+        if len(args) == 1:
+            start_e, stop_e, step_e = i32(0), args[0], i32(1)
+        elif len(args) == 2:
+            start_e, stop_e, step_e = args[0], args[1], i32(1)
+        elif len(args) == 3:
+            start_e, stop_e, step_e = args[0], args[1], args[2]
+            if isinstance(node.iter.args[2], ast.UnaryOp) and isinstance(node.iter.args[2].op, ast.USub):
+                step_const = -1
+        else:
+            raise SyntaxError("Invalid `range()` arguments.")
+
+        loop_var = self.fn.local(node.target.id, "i32", init=start_e)
+        with self.fn.block() as brk, self.fn.loop() as top:
+            cond = (loop_var < stop_e) if step_const > 0 else (loop_var > stop_e)
+            self.fn.br_if(cond.eqz(), brk)
+            with self.fn.block() as cont:
+                self.loop_stack.append((brk, cont))
+                try:
+                    for stmt in node.body:
+                        self.visit(stmt)
+                finally:
+                    self.loop_stack.pop()
+            loop_var.set(loop_var + step_e)
+            self.fn.br(top)
+
+    def visit_Break(self, node: ast.Break):
+        if not self.loop_stack:
+            raise SyntaxError("`break` outside of loop in WASM kernel.")
+        brk, _ = self.loop_stack[-1]
+        self.fn.br(brk)
+
+    def visit_Continue(self, node: ast.Continue):
+        if not self.loop_stack:
+            raise SyntaxError("`continue` outside of loop in WASM kernel.")
+        _, cont = self.loop_stack[-1]
+        self.fn.br(cont)
+
+    def visit_Return(self, node: ast.Return):
+        val = self.eval_expr(node.value) if node.value is not None else None
+        self.fn.ret(val)
+
+    def visit_Expr(self, node: ast.Expr):
+        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            return
+        res = self.eval_expr(node.value)
+        if isinstance(res, Expr):
+            self.fn._emit(res.code)
+# endregion
+
+
+# region 6 wasm_module_and_runtime_instantiation
+class WasmModule:
+    def __init__(self, align_bytes: int = 16):
+        self.align_bytes = align_bytes
+        self.next_offset = 0
+        self.arrays: dict[str, MemoryArray] = {}
+        self.struct_outs: dict[str, StructOut] = {}
+        self.functions: list[FuncBuilder] = []
+        self.section_sizes: dict[str, int] = {}
+        self._last_runtime: dict | None = None
+
+    def array(self, name: str, dtype: str, capacity: int, offset: int | None = None) -> MemoryArray:
+        if offset is None:
+            rem = self.next_offset % self.align_bytes
+            if rem:
+                self.next_offset += self.align_bytes - rem
+            offset = self.next_offset
+        arr = MemoryArray(self, name, dtype, capacity, offset)
+        self.arrays[name] = arr
+        self.next_offset = max(self.next_offset, offset + arr.byte_length)
+        return arr
+
+    def struct_out(self, name: str, fields: list[str], dtype: str = "f32", offset: int | None = None) -> StructOut:
+        arr = self.array(name, dtype, max(16, len(fields)), offset=offset)
+        so = StructOut(arr, fields)
+        self.struct_outs[name] = so
+        return so
+
+    def function(self, name: str, ret_type: str | None = "i32") -> FuncBuilder:
+        fn = FuncBuilder(name, ret_type)
+        self.functions.append(fn)
+        return fn
+
+    def kernel(self, ret: str | None = "i32", **param_types):
+        def decorator(py_fn):
+            sig = inspect.signature(py_fn)
+            ret_t = ret
+            if sig.return_annotation is not inspect.Parameter.empty:
+                ann = sig.return_annotation
+                ret_t = ann if isinstance(ann, str) else getattr(ann, "__name__", ret)
+
+            fn = self.function(py_fn.__name__, ret_type=ret_t)
+            fn.py_fn = py_fn
+            for p_name, p_obj in sig.parameters.items():
+                if p_name in param_types:
+                    p_type = param_types[p_name]
+                elif p_obj.annotation is not inspect.Parameter.empty:
+                    ann = p_obj.annotation
+                    p_type = ann if isinstance(ann, str) else getattr(ann, "__name__", "i32")
+                else:
+                    p_type = "i32"
+                fn.param(p_name, p_type)
+
+            env = dict(py_fn.__globals__)
+            if py_fn.__closure__:
+                for cell_name, cell in zip(py_fn.__code__.co_freevars, py_fn.__closure__):
+                    env[cell_name] = cell.cell_contents
+            env.update({
+                "i32": i32, "f32": f32, "byte_offset": byte_offset,
+                "select": select, "murmur_hash32": murmur_hash32,
+                "min": min, "max": max, "abs": abs,
+                "splat": lambda x: (x if isinstance(x, Expr) else f32(x)).splat(),
+                "any_true": lambda v: v.any_true(),
+                "all_true": lambda v: v.all_true(),
+                "sqrt": lambda x: x.sqrt(),
+                "clamp": lambda x, lo, hi: x.clamp(lo, hi),
+                "shr_u": lambda x, b: x.shr_u(b),
+                "lt_u": lambda a, b: a.lt_u(b),
+                "ge_u": lambda a, b: a.ge_u(b),
+            })
+
+            lines, start_line = inspect.getsourcelines(py_fn)
+            src = textwrap.dedent("".join(lines))
+            tree = ast.parse(src)
+            atok = asttokens.ASTTokens(src, tree=tree) if HAS_ASTTOKENS else None
+            fn_def = tree.body[0]
+
+            fn.beniget_report = analyze_ast_with_beniget(tree, fn.name, start_line_offset=start_line - 1)
+
+            with fn:
+                compiler = _ASTKernelCompiler(fn, env, atok=atok, start_line_offset=start_line - 1)
+                for stmt in fn_def.body:
+                    compiler.visit(stmt)
+
+            log_compiler_event(
+                "PASS",
+                "AST",
+                f"Compiled @kernel '{fn.name}' -> {len(fn.code)} bytes of bytecode ({len(fn.locals)} locals).",
+                line=start_line,
+            )
+            return fn
+
+        return decorator
+
+    def to_bytes(self, min_pages: int | None = None) -> bytes:
+        req_pages = (self.next_offset + 65535) // 65536
+        pages = max(req_pages, min_pages or 1)
+
+        type_sec = encode_section(
+            1, leb128_u(len(self.functions)) + b"".join(f.encode_signature() for f in self.functions)
+        )
+        func_sec = encode_section(
+            3, leb128_u(len(self.functions)) + b"".join(leb128_u(i) for i in range(len(self.functions)))
+        )
+        mem_sec = encode_section(5, leb128_u(1) + b"\x00" + leb128_u(pages))
+
+        def _exp(name: str, kind: int, idx: int) -> bytes:
+            nb = name.encode("ascii")
+            return leb128_u(len(nb)) + nb + bytes([kind]) + leb128_u(idx)
+
+        exps = [_exp("mem", 2, 0)] + [_exp(f.name, 0, i) for i, f in enumerate(self.functions)]
+        exp_sec = encode_section(7, leb128_u(len(exps)) + b"".join(exps))
+
+        code_sec = encode_section(
+            10, leb128_u(len(self.functions)) + b"".join(f.encode_body() for f in self.functions)
+        )
+        self.section_sizes = {
+            "Header": 8,
+            "Type (0x01)": len(type_sec),
+            "Func (0x03)": len(func_sec),
+            "Memory (0x05)": len(mem_sec),
+            "Export (0x07)": len(exp_sec),
+            "Code (0x0A)": len(code_sec),
+            "Pages (64KB)": pages,
+        }
+        total_bytes = b"\x00asm\x01\x00\x00\x00" + type_sec + func_sec + mem_sec + exp_sec + code_sec
+        log_compiler_event(
+            "INFO",
+            "EMIT",
+            f"Emitted WASM binary ({len(total_bytes)}B total: Code={len(code_sec)}B, Exports={len(exp_sec)}B, Memory={pages} page(s)).",
+        )
+        return total_bytes
+
+    def instantiate(self, min_pages: int | None = None, custom_wasm_bytes: bytes | None = None) -> dict:
+        wasm_bytes = custom_wasm_bytes or self.to_bytes(min_pages=min_pages)
+
+        if HAS_JS:
+            u8 = js.Uint8Array.new(len(wasm_bytes))
+            u8.assign(memoryview(wasm_bytes))
+            mod = js.WebAssembly.Module.new(u8)
+            inst = js.WebAssembly.Instance.new(mod)
+            ex = inst.exports
+            buf = ex.mem.buffer
+
+            result = {"wasm_bytes": wasm_bytes, "exports": ex, "module_obj": self}
+            for f in self.functions:
+                result[f.name] = getattr(ex, f.name)
+            for name, arr in self.arrays.items():
+                cls = js.Float32Array if arr.dtype == "f32" else js.Int32Array
+                result[name] = cls.new(buf, arr.byte_offset, arr.capacity)
+            for name, so in self.struct_outs.items():
+                so._bind_runtime(result[name])
+                result[f"{name}_struct"] = so
+            self._last_runtime = result
+            return result
+
+        import ctypes
+        import wasmtime
+        store = wasmtime.Store()
+        module = wasmtime.Module(store.engine, wasm_bytes)
+        instance = wasmtime.Instance(store, module, [])
+        exports = instance.exports(store)
+        mem = exports["mem"]
+        base_ptr = ctypes.addressof(mem.data_ptr(store).contents)
+
+        result = {"wasm_bytes": wasm_bytes, "store": store, "module_obj": self}
+        for f in self.functions:
+            fn_export = exports[f.name]
+            result[f.name] = lambda *args, _fn=fn_export: _fn(store, *args)
+        for name, arr in self.arrays.items():
+            c_type = ctypes.c_float if arr.dtype == "f32" else ctypes.c_int32
+            c_arr = (c_type * arr.capacity).from_address(base_ptr + arr.byte_offset)
+            result[name] = memoryview(c_arr)
+        for name, so in self.struct_outs.items():
+            so._bind_runtime(result[name])
+            result[f"{name}_struct"] = so
+        self._last_runtime = result
+        return result
+
+
+def compile_with_simd_fallback(builder_fn, min_pages: int | None = None) -> dict | None:
+    last_exc = None
+    for use_simd in (True, False):
+        try:
+            mod = builder_fn(use_simd=use_simd)
+            inst = mod.instantiate(min_pages=min_pages)
+            inst["simd"] = use_simd
+            inst["module_obj"] = mod
+            return inst
+        except WasmASTCompileError:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            log_compiler_event("WARN", "EMIT", f"SIMD={use_simd} instantiation failed ({exc}), trying fallback...")
+            continue
+    if last_exc is not None:
+        raise last_exc
+    return None
+# endregion
+
+
+# region 7 c_buffer_soa_arena_with_numpy_vectorization
+class SoAArena:
+    def __init__(
+        self,
+        schema: dict[str, str],
+        max_capacity: int = 262144,
+        wasm_runtime: dict | None = None,
+        spatial_chunk_fields: tuple[str, str, str, str, str] | None = None,
+    ):
+        self.schema = schema
+        self.max_capacity = max_capacity
+        self.capacity = max_capacity
+        self.cursor = 0
+        self.reclaimable = 0
+        self.wasm = wasm_runtime
+        self.spatial_chunk_fields = spatial_chunk_fields
+
+        self.fields: dict[str, array] = {
+            name: array("f" if dtype == "f32" else "i", [0]) * max_capacity
+            for name, dtype in schema.items()
+        }
+        self.np_fields: dict[str, "np.ndarray"] = {}
+        if HAS_NUMPY:
+            self._rebind_numpy_views()
+
+        if spatial_chunk_fields:
+            n_chunks = (max_capacity >> 2) + 4
+            self.chunkMinX = array("f", [0.0]) * n_chunks
+            self.chunkMaxX = array("f", [0.0]) * n_chunks
+            self.chunkMinY = array("f", [0.0]) * n_chunks
+            self.chunkMaxY = array("f", [0.0]) * n_chunks
+            self.chunkMaxBm = array("f", [0.0]) * n_chunks
+
+    def _rebind_numpy_views(self):
+        if not HAS_NUMPY:
+            return
+        for name, arr in self.fields.items():
+            dt = np.float32 if self.schema[name] == "f32" else np.int32
+            self.np_fields[name] = np.frombuffer(arr, dtype=dt)
+
+    def __getitem__(self, field_name: str) -> array:
+        return self.fields[field_name]
+
+    def as_numpy(self, field_name: str):
+        if HAS_NUMPY:
+            return self.np_fields[field_name][:self.cursor]
+        raise RuntimeError("NumPy is not loaded")
+
+    def clear(self):
+        self.cursor = 0
+        self.reclaimable = 0
+
+    def alloc(self, count: int) -> int:
+        if self.cursor + count > self.capacity:
+            self._grow(max(self.capacity * 2, self.cursor + count + 4096))
+        start = self.cursor
+        self.cursor += count
+        return start
+
+    def free(self, start: int, count: int):
+        if count <= 0:
+            return
+        if start + count == self.cursor:
+            self.cursor = start
+        else:
+            self.reclaimable += count
+
+    def sync_range_to_wasm(self, start: int, count: int, field_names: list[str] | None = None):
+        if count <= 0:
+            return
+        end = start + count
+
+        if self.spatial_chunk_fields:
+            if HAS_NUMPY:
+                k_x1, k_y1, k_x2, k_y2, k_bm = self.spatial_chunk_fields
+                c_start = start >> 2
+                c_end = ((min(end, self.cursor) - 1) >> 2) + 1
+                i0 = c_start << 2
+                i1 = min(self.cursor, c_end << 2)
+                if i0 < i1:
+                    indices = np.arange(0, i1 - i0, 4, dtype=np.intp)
+                    x1 = self.np_fields[k_x1][i0:i1]
+                    y1 = self.np_fields[k_y1][i0:i1]
+                    x2 = self.np_fields[k_x2][i0:i1]
+                    y2 = self.np_fields[k_y2][i0:i1]
+                    bm = self.np_fields[k_bm][i0:i1]
+
+                    np.frombuffer(self.chunkMinX, dtype=np.float32)[c_start:c_start + len(indices)] = np.minimum.reduceat(np.minimum(x1, x2), indices)
+                    np.frombuffer(self.chunkMaxX, dtype=np.float32)[c_start:c_start + len(indices)] = np.maximum.reduceat(np.maximum(x1, x2), indices)
+                    np.frombuffer(self.chunkMinY, dtype=np.float32)[c_start:c_start + len(indices)] = np.minimum.reduceat(np.minimum(y1, y2), indices)
+                    np.frombuffer(self.chunkMaxY, dtype=np.float32)[c_start:c_start + len(indices)] = np.maximum.reduceat(np.maximum(y1, y2), indices)
+                    np.frombuffer(self.chunkMaxBm, dtype=np.float32)[c_start:c_start + len(indices)] = np.maximum.reduceat(bm, indices)
+            else:
+                f_x1, f_y1, f_x2, f_y2, f_bm = (self.fields[k] for k in self.spatial_chunk_fields)
+                c_min_x, c_max_x = self.chunkMinX, self.chunkMaxX
+                c_min_y, c_max_y = self.chunkMinY, self.chunkMaxY
+                c_max_bm = self.chunkMaxBm
+                limit = self.cursor
+                for c in range(start >> 2, ((end - 1) >> 2) + 1):
+                    i0 = c << 2
+                    i1 = min(limit, i0 + 4)
+                    if i0 >= i1:
+                        break
+                    mn_x = mx_x = f_x1[i0]
+                    mn_y = mx_y = f_y1[i0]
+                    mbm = 0.0
+                    for k in range(i0, i1):
+                        x1, y1, x2, y2, m = f_x1[k], f_y1[k], f_x2[k], f_y2[k], f_bm[k]
+                        if x1 < mn_x: mn_x = x1
+                        if x2 < mn_x: mn_x = x2
+                        if x1 > mx_x: mx_x = x1
+                        if x2 > mx_x: mx_x = x2
+                        if y1 < mn_y: mn_y = y1
+                        if y2 < mn_y: mn_y = y2
+                        if y1 > mx_y: mx_y = y1
+                        if y2 > mx_y: mx_y = y2
+                        if m > mbm: mbm = m
+                    c_min_x[c], c_max_x[c] = mn_x, mx_x
+                    c_min_y[c], c_max_y[c] = mn_y, mx_y
+                    c_max_bm[c] = mbm
+
+        w = self.wasm
+        if w is None or end > self.max_capacity:
+            return
+        for name in (field_names or self.schema.keys()):
+            if name not in w:
+                continue
+            py_mv = memoryview(self.fields[name])[start:end]
+            w_arr = w[name]
+            if HAS_JS:
+                w_arr.subarray(start, end).assign(py_mv)
+            else:
+                w_arr[start:end] = py_mv
+
+    def fill_wasm_field(self, field_name: str, start: int, count: int, value: float | int):
+        w = self.wasm
+        end = start + count
+        if w is not None and count > 0 and end <= self.max_capacity:
+            if HAS_JS:
+                w[field_name].fill(value, start, end)
+            else:
+                tc = "f" if self.schema[field_name] == "f32" else "i"
+                w[field_name][start:end] = memoryview(array(tc, [value]) * count)
+
+    def should_compact(self, min_reclaim: int = 4096) -> bool:
+        return self.reclaimable > min_reclaim and self.reclaimable > (self.cursor >> 1)
+
+    def compact(self, owners, start_attr: str = "seg_start", count_attr: str = "seg_count"):
+        write = 0
+        for obj in owners:
+            count = getattr(obj, count_attr)
+            if not count:
+                continue
+            read = getattr(obj, start_attr)
+            if read != write:
+                end = read + count
+                for arr in self.fields.values():
+                    arr[write:write + count] = arr[read:end]
+                setattr(obj, start_attr, write)
+            write += count
+        self.cursor = write
+        self.reclaimable = 0
+        if write > 0:
+            self.sync_range_to_wasm(0, write)
+
+    def _grow(self, new_cap: int):
+        extra = new_cap - self.capacity
+        self.capacity = new_cap
+        for name, dtype in self.schema.items():
+            tc = "f" if dtype == "f32" else "i"
+            self.fields[name].extend(array(tc, [0]) * extra)
+        if HAS_NUMPY:
+            self._rebind_numpy_views()
+        if self.spatial_chunk_fields:
+            n_chunks = ((new_cap >> 2) + 4) - len(self.chunkMinX)
+            if n_chunks > 0:
+                ext = array("f", [0.0]) * n_chunks
+                self.chunkMinX.extend(ext)
+                self.chunkMaxX.extend(ext)
+                self.chunkMinY.extend(ext)
+                self.chunkMaxY.extend(ext)
+                self.chunkMaxBm.extend(ext)
+        if new_cap > self.max_capacity:
+            self.wasm = None
+# endregion
+  </script>
+
+  <!-- ===================================================================== -->
+  <!-- CUSTOM PYTHON EXECUTION, DIAGNOSTICS, BASE64 & DISASSEMBLER BRIDGE    -->
+  <!-- ===================================================================== -->
+  <script id="python-disassembler-bridge" type="text/python">
+import base64
+import io
+import sys
+import time
+
+# region 8 wasm_bytecode_disassembler
+_ACTIVE_USER_MOD: WasmModule | None = None
+_ACTIVE_USER_RUNTIME: dict | None = None
+_ACTIVE_USER_ARENAS: dict[str, SoAArena] = {}
+
+OPCODE_NAMES = {
+    0x02: "block", 0x03: "loop", 0x04: "if", 0x05: "else", 0x0B: "end",
+    0x0C: "br", 0x0D: "br_if", 0x0F: "return", 0x1B: "select",
+    0x20: "local.get", 0x21: "local.set", 0x22: "local.tee",
+    0x28: "i32.load", 0x2A: "f32.load", 0x36: "i32.store", 0x38: "f32.store",
+    0x41: "i32.const", 0x43: "f32.const",
+    0x45: "i32.eqz", 0x46: "i32.eq", 0x47: "i32.ne", 0x48: "i32.lt_s",
+    0x49: "i32.lt_u", 0x4A: "i32.gt_s", 0x4B: "i32.gt_u", 0x4C: "i32.le_s",
+    0x4D: "i32.le_u", 0x4E: "i32.ge_s", 0x4F: "i32.ge_u",
+    0x5B: "f32.eq", 0x5C: "f32.ne", 0x5D: "f32.lt", 0x5E: "f32.gt", 0x5F: "f32.le", 0x60: "f32.ge",
+    0x6A: "i32.add", 0x6B: "i32.sub", 0x6C: "i32.mul", 0x6D: "i32.div_s", 0x6F: "i32.rem_s",
+    0x71: "i32.and", 0x72: "i32.or", 0x73: "i32.xor", 0x74: "i32.shl", 0x75: "i32.shr_s", 0x76: "i32.shr_u",
+    0x8B: "f32.abs", 0x8C: "f32.neg", 0x8D: "f32.ceil", 0x8E: "f32.floor", 0x91: "f32.sqrt",
+    0x92: "f32.add", 0x93: "f32.sub", 0x94: "f32.mul", 0x95: "f32.div", 0x96: "f32.min", 0x97: "f32.max",
+    0xA8: "i32.trunc_f32_s", 0xB2: "f32.convert_i32_s", 0xBC: "i32.reinterpret_f32", 0xBE: "f32.reinterpret_i32",
+}
+
+SIMD_SUB_OPCODES = {
+    0x00: "v128.load", 0x0B: "v128.store",
+    0x11: "i32x4.splat", 0x13: "f32x4.splat",
+    0x41: "f32x4.eq", 0x42: "f32x4.ne", 0x43: "f32x4.lt", 0x44: "f32x4.gt", 0x45: "f32x4.le", 0x46: "f32x4.ge",
+    0x4D: "v128.not", 0x4E: "v128.and", 0x50: "v128.or", 0x51: "v128.xor", 0x53: "v128.any_true",
+    0x66: "f32x4.ceil", 0x67: "f32x4.floor",
+    0xA3: "i32x4.all_true",
+    0xE0: "f32x4.abs", 0xE1: "f32x4.neg", 0xE3: "f32x4.sqrt",
+    0xE4: "f32x4.add", 0xE5: "f32x4.sub", 0xE6: "f32x4.mul", 0xE7: "f32x4.div",
+    0xEC: "f32x4.min", 0xED: "f32x4.max",
+}
+
+
+def _read_leb128_u(buf: bytes, pos: int) -> tuple[int, int]:
+    res, shift = 0, 0
+    while pos < len(buf):
+        b = buf[pos]
+        pos += 1
+        res |= (b & 0x7F) << shift
+        if (b & 0x80) == 0:
+            break
+        shift += 7
+    return res, pos
+
+
+def _read_leb128_s(buf: bytes, pos: int) -> tuple[int, int]:
+    res, shift, b = 0, 0, 0
+    while pos < len(buf):
+        b = buf[pos]
+        pos += 1
+        res |= (b & 0x7F) << shift
+        shift += 7
+        if (b & 0x80) == 0:
+            break
+    if (shift < 32) and (b & 0x40):
+        res |= -(1 << shift)
+    return res, pos
+
+
+def _lookup_line(offset: int, line_spans: list[tuple[int, int, int, str]] | None):
+    if not line_spans:
+        return None, ""
+    for s_off, e_off, lineno, src in line_spans:
+        if s_off <= offset < e_off:
+            return lineno, src
+    return None, ""
+
+
+def disassemble_code(code: bytes, line_spans: list[tuple[int, int, int, str]] | None = None) -> list[dict]:
+    lines = []
+    pos = 0
+    indent = 0
+    while pos < len(code):
+        start_pos = pos
+        op = code[pos]
+        pos += 1
+        if op in (0x02, 0x03, 0x04):
+            pos += 1
+            text = f"{'  '*indent}{OPCODE_NAMES[op]} (void)"
+            indent += 1
+        elif op == 0x05:
+            text = f"{'  '*max(0,indent-1)}else"
+        elif op == 0x0B:
+            indent = max(0, indent - 1)
+            text = f"{'  '*indent}end"
+        elif op in (0x0C, 0x0D, 0x20, 0x21, 0x22):
+            val, pos = _read_leb128_u(code, pos)
+            text = f"{'  '*indent}{OPCODE_NAMES[op]} {val}"
+        elif op in (0x28, 0x2A, 0x36, 0x38):
+            align, pos = _read_leb128_u(code, pos)
+            offset, pos = _read_leb128_u(code, pos)
+            text = f"{'  '*indent}{OPCODE_NAMES[op]} offset={offset} align={1<<align}"
+        elif op == 0x41:
+            val, pos = _read_leb128_s(code, pos)
+            text = f"{'  '*indent}i32.const {val}"
+        elif op == 0x43:
+            fval = struct.unpack("<f", code[pos:pos+4])[0]
+            pos += 4
+            text = f"{'  '*indent}f32.const {fval:.4g}"
+        elif op == 0xFD:
+            sub, pos = _read_leb128_u(code, pos)
+            sub_name = SIMD_SUB_OPCODES.get(sub, f"v128.op_{hex(sub)}")
+            if sub in (0x00, 0x0B):
+                align, pos = _read_leb128_u(code, pos)
+                offset, pos = _read_leb128_u(code, pos)
+                text = f"{'  '*indent}{sub_name} offset={offset} align={1<<align}"
+            else:
+                text = f"{'  '*indent}{sub_name}"
+        else:
+            name = OPCODE_NAMES.get(op, f"op_{hex(op)}")
+            text = f"{'  '*indent}{name}"
+
+        py_line, py_src = _lookup_line(start_pos, line_spans)
+        lines.append({
+            "offset": start_pos,
+            "byte_len": pos - start_pos,
+            "hex": code[start_pos:pos].hex(" "),
+            "text": text,
+            "py_line": py_line,
+            "py_src": py_src,
+            "is_simd": (op == 0xFD),
+        })
+    return lines
+# endregion
+
+
+# region 9 wasm_execution_and_inspection_bridge_with_diagnostics
+def _build_error_report(exc: Exception, user_py_code: str, fname: str = "<custom_user_code>") -> dict:
+    """Extracts line numbers, caret excerpts, kernel context, and clean tracebacks from any exception."""
+    src_lines = user_py_code.splitlines()
+    lineno = getattr(exc, "lineno", None)
+    col_offset = getattr(exc, "col_offset", getattr(exc, "offset", None))
+    kernel_name = getattr(exc, "kernel_name", None)
+    err_type = type(exc).__name__
+    msg = getattr(exc, "message", getattr(exc, "msg", str(exc)))
+
+    tb_list = traceback.extract_tb(exc.__traceback__)
+    if lineno is None:
+        for frame in reversed(tb_list):
+            if frame.filename == fname:
+                lineno = frame.lineno
+                break
+
+    excerpt = ""
+    if lineno is not None and 1 <= lineno <= len(src_lines):
+        start_l = max(1, lineno - 1)
+        end_l = min(len(src_lines), lineno + 1)
+        snippet_rows = []
+        for l_idx in range(start_l, end_l + 1):
+            prefix = ">> " if l_idx == lineno else "   "
+            snippet_rows.append(f"{prefix}{l_idx:3d} | {src_lines[l_idx - 1]}")
+            if l_idx == lineno and col_offset is not None and col_offset >= 0:
+                caret_pad = " " * (9 + max(0, int(col_offset)))
+                snippet_rows.append(f"{caret_pad}^")
+        excerpt = "\n".join(snippet_rows)
+
+    filtered_tb = []
+    for frame in tb_list:
+        if frame.filename in (fname, "<app_init>"):
+            loc_tag = "User Code" if frame.filename == fname else "PyWASM Compiler"
+            filtered_tb.append(f"  [{loc_tag}] line {frame.lineno}, in {frame.name}\n    {frame.line or ''}")
+
+    log_compiler_event(
+        "ERROR",
+        "DIAGNOSTIC",
+        f"{err_type} at L{lineno or '?'}: {msg}",
+        line=lineno,
+    )
+
+    return {
+        "error_type": err_type,
+        "message": msg,
+        "lineno": lineno,
+        "col_offset": col_offset,
+        "kernel_name": kernel_name,
+        "excerpt": excerpt,
+        "traceback": "\n".join(filtered_tb) if filtered_tb else traceback.format_exc(),
+    }
+
+
+def _snapshot_module_and_runtime(mod: WasmModule | None, runtime: dict | None, arenas: dict[str, SoAArena]):
+    TYPE_NAMES = {I32: "i32", F32: "f32", V128: "v128", None: "void"}
+    fn_disasm = []
+    arrays_info = []
+    struct_outs_info = []
+    line_byte_counts: dict[int, dict] = {}
+    wasm_bytes = b""
+    section_sizes = {}
+
+    if mod is not None:
+        if runtime is not None and "wasm_bytes" in runtime:
+            wasm_bytes = runtime["wasm_bytes"]
+        else:
+            wasm_bytes = mod.to_bytes()
+        section_sizes = dict(mod.section_sizes)
+
+        for fn in mod.functions:
+            insts = disassemble_code(bytes(fn.code), fn.line_spans)
+            for ins in insts:
+                ln = ins.get("py_line")
+                if ln is not None:
+                    entry = line_byte_counts.setdefault(ln, {"bytes": 0, "ops": 0, "simd": 0})
+                    entry["bytes"] += ins.get("byte_len", 1)
+                    entry["ops"] += 1
+                    if ins.get("is_simd"):
+                        entry["simd"] += 1
+
+            fn_disasm.append({
+                "name": fn.name,
+                "ret": TYPE_NAMES.get(fn.ret_type, "void"),
+                "params": [TYPE_NAMES.get(p, "i32") for p in fn.params],
+                "param_names": list(fn.param_names),
+                "locals": [TYPE_NAMES.get(l, "i32") for l in fn.locals],
+                "instructions": insts,
+                "sympy_rewrites": list(fn.sympy_rewrites),
+                "beniget_report": dict(fn.beniget_report),
+            })
+
+        for name, arr in mod.arrays.items():
+            preview = []
+            np_stats = None
+            if runtime and name in runtime:
+                w_arr = runtime[name]
+                limit = min(12, arr.capacity)
+                preview = [round(float(w_arr[i]), 4) if arr.dtype == "f32" else int(w_arr[i]) for i in range(limit)]
+                if HAS_NUMPY:
+                    sample_len = min(256, arr.capacity)
+                    np_a = np.array([float(w_arr[i]) for i in range(sample_len)], dtype=np.float32)
+                    np_stats = {
+                        "min": round(float(np.min(np_a)), 4),
+                        "max": round(float(np.max(np_a)), 4),
+                        "mean": round(float(np.mean(np_a)), 4),
+                    }
+            arrays_info.append({
+                "name": name,
+                "dtype": arr.dtype,
+                "capacity": arr.capacity,
+                "byte_offset": arr.byte_offset,
+                "byte_length": arr.byte_length,
+                "preview": preview,
+                "np_stats": np_stats,
+            })
+
+        for name, so in mod.struct_outs.items():
+            try:
+                struct_outs_info.append({
+                    "name": name,
+                    "fields": so.to_dict() if runtime else list(object.__getattribute__(so, "_fields").keys())
+                })
+            except Exception:
+                pass
+
+    arenas_info = []
+    for a_name, arena in arenas.items():
+        field_previews = {}
+        for f_name, f_arr in arena.fields.items():
+            limit = min(8, arena.cursor if arena.cursor > 0 else arena.capacity)
+            field_previews[f_name] = [round(float(f_arr[i]), 4) if arena.schema[f_name] == "f32" else int(f_arr[i]) for i in range(limit)]
+        arenas_info.append({
+            "name": a_name,
+            "capacity": arena.capacity,
+            "cursor": arena.cursor,
+            "reclaimable": arena.reclaimable,
+            "schema": dict(arena.schema),
+            "previews": field_previews,
+            "numpy_backed": bool(HAS_NUMPY),
+        })
+
+    wasm_b64 = base64.b64encode(wasm_bytes).decode("ascii") if wasm_bytes else ""
+
+    return {
+        "wasm_b64": wasm_b64,
+        "wasm_hex": [f"{b:02x}" for b in wasm_bytes],
+        "wasm_size": len(wasm_bytes),
+        "section_sizes": section_sizes,
+        "functions": fn_disasm,
+        "arrays": arrays_info,
+        "struct_outs": struct_outs_info,
+        "arenas": arenas_info,
+        "line_byte_counts": line_byte_counts,
+        "compiler_logs": list(_COMPILER_LOGS),
+    }
+
+
+def compile_playground_code(user_py_code: str) -> dict:
+    global _ACTIVE_USER_MOD, _ACTIVE_USER_RUNTIME, _ACTIVE_USER_ARENAS
+    _COMPILER_LOGS.clear()
+
+    if not user_py_code or not user_py_code.strip():
+        return {
+            "ok": False,
+            "elapsed_ms": 0.0,
+            "stdout": "",
+            "error_report": {
+                "error_type": "ValueError",
+                "message": "Python editor is empty. Enter Python code or select a built-in example.",
+                "lineno": 1,
+                "col_offset": 0,
+                "kernel_name": None,
+                "excerpt": "",
+                "traceback": "",
+            },
+            "compiler_logs": list(_COMPILER_LOGS),
+        }
+
+    fname = "<custom_user_code>"
+    lines = [line + "\n" for line in user_py_code.splitlines()]
+    linecache.cache[fname] = (len(user_py_code), None, lines, fname)
+
+    base_env = {
+        "WasmModule": WasmModule,
+        "FuncBuilder": FuncBuilder,
+        "MemoryArray": MemoryArray,
+        "StructOut": StructOut,
+        "Expr": Expr,
+        "i32": i32,
+        "f32": f32,
+        "byte_offset": byte_offset,
+        "select": select,
+        "murmur_hash32": murmur_hash32,
+        "I32": I32,
+        "F32": F32,
+        "V128": V128,
+        "compile_with_simd_fallback": compile_with_simd_fallback,
+        "SoAArena": SoAArena,
+        "np": np,
+        "sympy": sympy,
+    }
+    ns = dict(base_env)
+
+    stdout_buf = io.StringIO()
+    old_stdout, old_stderr = sys.stdout, sys.stderr
+    sys.stdout = stdout_buf
+    sys.stderr = stdout_buf
+
+    mod: WasmModule | None = None
+    runtime: dict | None = None
+    summary: dict = {}
+
+    t0 = time.perf_counter()
+    try:
+        code_obj = compile(user_py_code, fname, "exec")
+        exec(code_obj, ns)
+
+        if "run_demo" in ns and callable(ns["run_demo"]):
+            demo_res = ns["run_demo"]()
+            if isinstance(demo_res, tuple):
+                if len(demo_res) == 3:
+                    mod, runtime, summary = demo_res
+                elif len(demo_res) == 2:
+                    mod, runtime = demo_res
+            elif isinstance(demo_res, WasmModule):
+                mod = demo_res
+            elif isinstance(demo_res, dict):
+                if "wasm_bytes" in demo_res:
+                    runtime = demo_res
+                    mod = runtime.get("module_obj")
+                else:
+                    summary = demo_res
+
+        arenas: dict[str, SoAArena] = {}
+        for k, v in ns.items():
+            if k in base_env or k.startswith("_"):
+                continue
+            if isinstance(v, WasmModule):
+                mod = v
+            elif isinstance(v, dict) and "wasm_bytes" in v and "exports" in v:
+                runtime = v
+                if mod is None and isinstance(v.get("module_obj"), WasmModule):
+                    mod = v["module_obj"]
+            elif isinstance(v, SoAArena):
+                arenas[k] = v
+            elif isinstance(v, (int, float, str, bool, list, tuple, dict)) and k != "run_demo":
+                if not isinstance(summary, dict):
+                    summary = {"result": str(summary)}
+                if k not in summary:
+                    try:
+                        summary[k] = v if isinstance(v, (int, float, str, bool)) else repr(v)[:200]
+                    except Exception:
+                        pass
+
+        if mod is not None and runtime is None:
+            if mod._last_runtime is not None:
+                runtime = mod._last_runtime
+            elif len(mod.functions) > 0:
+                runtime = mod.instantiate()
+
+    except Exception as exc:
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        err_report = _build_error_report(exc, user_py_code, fname)
+        return {
+            "ok": False,
+            "elapsed_ms": round(elapsed_ms, 2),
+            "stdout": stdout_buf.getvalue(),
+            "error_report": err_report,
+            "compiler_logs": list(_COMPILER_LOGS),
+        }
+    finally:
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    _ACTIVE_USER_MOD = mod
+    _ACTIVE_USER_RUNTIME = runtime
+    _ACTIVE_USER_ARENAS = arenas
+
+    log_compiler_event("PASS", "EXEC", f"Script executed in {elapsed_ms:.2f} ms.")
+    snap = _snapshot_module_and_runtime(mod, runtime, arenas)
+    return {
+        "ok": True,
+        "elapsed_ms": round(elapsed_ms, 2),
+        "stdout": stdout_buf.getvalue(),
+        "summary": summary if isinstance(summary, dict) else {"Result": str(summary)},
+        "error_report": None,
+        **snap,
+    }
+
+
+def apply_optimized_wasm_b64(opt_b64: str) -> dict:
+    """Hot-swaps the active runtime with Binaryen-optimized WebAssembly bytes."""
+    global _ACTIVE_USER_RUNTIME
+    if _ACTIVE_USER_MOD is None:
+        raise RuntimeError("No active WasmModule to swap.")
+    opt_bytes = base64.b64decode(opt_b64)
+    old_rt = _ACTIVE_USER_RUNTIME
+    new_rt = _ACTIVE_USER_MOD.instantiate(custom_wasm_bytes=opt_bytes)
+    if old_rt is not None and HAS_JS:
+        for name in _ACTIVE_USER_MOD.arrays:
+            if name in old_rt and name in new_rt:
+                new_rt[name].set(old_rt[name])
+    _ACTIVE_USER_RUNTIME = new_rt
+    log_compiler_event("OPT", "BINARYEN", f"Hot-swapped active WebAssembly instance with Binaryen -O3 binary ({len(opt_bytes)}B).")
+    return _snapshot_module_and_runtime(_ACTIVE_USER_MOD, _ACTIVE_USER_RUNTIME, _ACTIVE_USER_ARENAS)
+
+
+def invoke_active_wasm_function(fn_name: str, args: list) -> dict:
+    if _ACTIVE_USER_MOD is None or _ACTIVE_USER_RUNTIME is None:
+        raise RuntimeError("No instantiated WasmModule is currently active.")
+    if fn_name not in _ACTIVE_USER_RUNTIME:
+        raise ValueError(f"Exported function '{fn_name}' not found in active runtime.")
+
+    fn_builder = next((f for f in _ACTIVE_USER_MOD.functions if f.name == fn_name), None)
+    typed_args = []
+    for idx, val in enumerate(args):
+        if fn_builder and idx < len(fn_builder.params):
+            ptype = fn_builder.params[idx]
+            typed_args.append(float(val) if ptype == F32 else int(float(val)))
+        else:
+            typed_args.append(float(val) if "." in str(val) else int(val))
+
+    t0 = time.perf_counter()
+    ret_val = _ACTIVE_USER_RUNTIME[fn_name](*typed_args)
+    dt_us = (time.perf_counter() - t0) * 1_000_000.0
+
+    if fn_builder and fn_builder.ret_type == F32 and ret_val is not None:
+        ret_val = round(float(ret_val), 6)
+    elif ret_val is not None:
+        ret_val = int(ret_val)
+
+    log_compiler_event("INFO", "EXEC", f"Called {fn_name}({', '.join(map(str, typed_args))}) -> {ret_val} ({dt_us:.2f} µs)")
+    snap = _snapshot_module_and_runtime(_ACTIVE_USER_MOD, _ACTIVE_USER_RUNTIME, _ACTIVE_USER_ARENAS)
+    return {
+        "fn_name": fn_name,
+        "args": typed_args,
+        "return_value": ret_val,
+        "latency_us": round(dt_us, 2),
+        **snap,
+    }
+
+
+def run_hypothesis_fuzz(fn_name: str, max_examples: int = 25) -> dict:
+    """Property-based fuzz testing of a compiled WASM kernel via `hypothesis`."""
+    if not HAS_HYPOTHESIS:
+        raise RuntimeError("Hypothesis package is not available.")
+    if _ACTIVE_USER_MOD is None or _ACTIVE_USER_RUNTIME is None:
+        raise RuntimeError("No active WASM runtime.")
+    fn_builder = next((f for f in _ACTIVE_USER_MOD.functions if f.name == fn_name), None)
+    if fn_builder is None:
+        raise ValueError(f"Function {fn_name} not found.")
+
+    min_cap = min((arr.capacity for arr in _ACTIVE_USER_MOD.arrays.values()), default=64)
+    safe_n = max(1, min(64, min_cap))
+
+    strat_list = []
+    for p_name, p_type in zip(fn_builder.param_names, fn_builder.params):
+        if p_type == I32:
+            if p_name in ("n", "width", "samples", "count"):
+                strat_list.append(st.integers(min_value=1, max_value=safe_n))
+            elif "iter" in p_name:
+                strat_list.append(st.integers(min_value=1, max_value=32))
+            else:
+                strat_list.append(st.integers(min_value=-10000, max_value=10000))
+        else:
+            strat_list.append(st.floats(min_value=-100.0, max_value=100.0, width=32, allow_nan=False, allow_infinity=False))
+
+    args_strategy = st.tuples(*strat_list)
+    tested_samples = []
+    wasm_fn = _ACTIVE_USER_RUNTIME[fn_name]
+
+    t0 = time.perf_counter()
+
+    @settings(
+        max_examples=max_examples,
+        database=None,
+        deadline=None,
+        suppress_health_check=list(HealthCheck),
+    )
+    @given(args_strategy)
+    def _prop_check(arg_tuple):
+        r1 = wasm_fn(*arg_tuple)
+        r2 = wasm_fn(*arg_tuple)
+        if fn_builder.ret_type == F32:
+            assert math.isfinite(float(r1)) or math.isnan(float(r1))
+            if not math.isnan(float(r1)):
+                assert math.isclose(float(r1), float(r2), rel_tol=1e-5, abs_tol=1e-6)
+        elif fn_builder.ret_type == I32:
+            assert int(r1) == int(r2)
+        if len(tested_samples) < 6:
+            tested_samples.append({
+                "args": [round(float(x), 4) if isinstance(x, float) else int(x) for x in arg_tuple],
+                "ret": round(float(r1), 5) if fn_builder.ret_type == F32 else int(r1),
+            })
+
+    _prop_check()
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    log_compiler_event("PASS", "FUZZ", f"Hypothesis verified '{fn_name}' across {max_examples} generated test cases ({elapsed_ms:.1f} ms).")
+    snap = _snapshot_module_and_runtime(_ACTIVE_USER_MOD, _ACTIVE_USER_RUNTIME, _ACTIVE_USER_ARENAS)
+
+    return {
+        "fn_name": fn_name,
+        "examples_run": max_examples,
+        "status": "PASSED (Deterministic & Non-Trapping)",
+        "elapsed_ms": round(elapsed_ms, 2),
+        "samples": tested_samples,
+        **snap,
+    }
+
+
+def inspect_single_expr(expr_str: str) -> dict:
+    if not expr_str or not expr_str.strip():
+        raise ValueError("Enter a Python WASM `Expr` expression.")
+    mod = WasmModule()
+    fn = mod.function("test")
+    a = fn.param("a", "f32")
+    b = fn.param("b", "f32")
+    i = fn.param("i", "i32")
+    j = fn.param("j", "i32")
+    v1 = fn.local("v1", "v128")
+    v2 = fn.local("v2", "v128")
+    arr = mod.array("arr", "f32", 64)
+
+    env = {
+        "a": a, "b": b, "i": i, "j": j, "v1": v1, "v2": v2, "arr": arr,
+        "i32": i32, "f32": f32, "byte_offset": byte_offset,
+        "select": select, "murmur_hash32": murmur_hash32,
+    }
+    res = eval(expr_str, {"__builtins__": {}}, env)
+    if not isinstance(res, Expr):
+        raise ValueError("Expression did not evaluate to a WASM `Expr` instance.")
+
+    sympy_info = None
+    if HAS_SYMPY:
+        try:
+            sa, sb, si, sj = sympy.symbols("a b i j", real=True)
+            sym_val = eval(expr_str, {"__builtins__": {}}, {"a": sa, "b": sb, "i": si, "j": sj})
+            if isinstance(sym_val, sympy.Basic):
+                repls, reduced = sympy.cse([sym_val])
+                sympy_info = {
+                    "simplified": str(sympy.simplify(sym_val)),
+                    "horner": str(sympy.horner(sym_val)) if sym_val.is_polynomial() else str(sym_val),
+                    "cse_temps": [f"{lhs} = {rhs}" for lhs, rhs in repls],
+                    "cse_result": str(reduced[0]),
+                }
+        except Exception:
+            sympy_info = None
+
+    t_map = {I32: "i32 (0x7F)", F32: "f32 (0x7D)", V128: "v128 (0x7B)"}
+    return {
+        "vtype": t_map.get(res.vtype, hex(res.vtype)),
+        "is_byte_offset": bool(res.is_byte_offset),
+        "hex": res.code.hex(" "),
+        "b64": base64.b64encode(res.code).decode("ascii"),
+        "byte_len": len(res.code),
+        "instructions": disassemble_code(res.code),
+        "sympy_info": sympy_info,
+    }
+
+
+def encode_leb_demo(val: int) -> dict:
+    u_bytes = leb128_u(max(0, val))
+    s_bytes = leb128_s(val)
+    return {
+        "u_hex": u_bytes.hex(" "),
+        "u_b64": base64.b64encode(u_bytes).decode("ascii"),
+        "s_hex": s_bytes.hex(" "),
+        "s_b64": base64.b64encode(s_bytes).decode("ascii"),
+    }
+# endregion
+  </script>
+
+  <!-- ===================================================================== -->
+  <!-- MINIMAL FRONTEND WITH CODEMIRROR 6, BINARYEN, WABT & COMLINK          -->
+  <!-- ===================================================================== -->
+  <script type="module">
+    import { createSignal, createEffect, onSettled } from 'solid-js';
+    import { render } from '@solidjs/web';
+    import html from '@solidjs/html';
+    import { EditorState, StateField, StateEffect } from '@codemirror/state';
+    import { EditorView, lineNumbers, keymap, Decoration, WidgetType } from '@codemirror/view';
+    import { defaultKeymap, indentWithTab } from '@codemirror/commands';
+    import { python } from '@codemirror/lang-python';
+    import { wast } from '@codemirror/lang-wast';
+    import binaryen from 'binaryen';
+    import wabt from 'wabt';
+    import * as Comlink from 'comlink';
+
+    // # region 10 builtin_python_and_expr_examples
+    const BUILTIN_PYTHON_EXAMPLES = [
+      {
+        id: 'ex1_simd_saxpy',
+        title: 'Example 1: 4-Wide SIMD SAXPY, SymPy Horner & StructOut',
+        code: `# region 1 simd_saxpy_module_definition
+def build_vector_module(use_simd=True):
+    mod = WasmModule(align_bytes=16)
+    N = 1024
+
+    X = mod.array("X", "f32", N)
+    Y = mod.array("Y", "f32", N)
+    Z = mod.array("Z", "f32", N)
+    stats = mod.struct_out("stats", ["first", "last", "max_val", "sum_total"], dtype="f32")
+
+    @mod.kernel(ret="i32", n="i32", alpha="f32")
+    def saxpy_simd(n, alpha):
+        i: i32 = 0
+        if use_simd:
+            v_alpha = splat(alpha)
+            n_vec: i32 = n & ~3
+            while i < n_vec:
+                off = byte_offset(i)
+                Z.v128[off] = (X.v128[off] * v_alpha) + Y.v128[off]
+                i += 4
+
+        while i < n:
+            Z[i] = X[i] * alpha + Y[i]
+            i += 1
+
+        # Compute summary stats + polynomial gain (SymPy Horner factors alpha*alpha + 2.0*alpha + 1.0)
+        poly_gain: f32 = alpha * alpha + 2.0 * alpha + 1.0
+        total: f32 = 0.0
+        max_v: f32 = -999999.0
+        for k in range(0, n):
+            val: f32 = Z[k]
+            total += val
+            max_v = val if val > max_v else max_v
+
+        stats.first = Z[0] * poly_gain
+        stats.last = Z[n - 1]
+        stats.max_val = max_v
+        stats.sum_total = total
+        return n
+
+    return mod
+# endregion
+
+# region 2 simd_saxpy_execution
+runtime = compile_with_simd_fallback(build_vector_module)
+mod = runtime["module_obj"]
+
+for i in range(256):
+    runtime["X"][i] = float(i + 1)
+    runtime["Y"][i] = 10.0
+
+processed = runtime["saxpy_simd"](256, 2.5)
+telemetry = runtime["stats_struct"].to_dict()
+
+print(f"SIMD Active: {runtime['simd']}")
+print(f"Processed {processed} elements")
+print("StructOut Telemetry:", telemetry)
+# endregion`
+      },
+      {
+        id: 'ex2_soa_arena',
+        title: 'Example 2: NumPy-Vectorized SoAArena & Spatial Query',
+        code: `import math
+
+# region 1 spatial_query_kernel_definition
+CAP = 1024
+mod = WasmModule(align_bytes=16)
+
+px = mod.array("px", "f32", CAP)
+py = mod.array("py", "f32", CAP)
+hit = mod.array("hit", "i32", CAP)
+out = mod.struct_out("out", ["hits", "closest_dist", "centroid_x", "centroid_y"], dtype="f32")
+
+@mod.kernel(ret="i32", n="i32", qx="f32", qy="f32", radius="f32")
+def query_particles(n, qx, qy, radius):
+    r2: f32 = radius * radius
+    hits: i32 = 0
+    min_d2: f32 = 99999999.0
+    sum_x: f32 = 0.0
+    sum_y: f32 = 0.0
+
+    for i in range(0, n):
+        off = byte_offset(i)
+        dx: f32 = px[off] - qx
+        dy: f32 = py[off] - qy
+        d2: f32 = dx * dx + dy * dy
+        min_d2 = min(min_d2, d2)
+
+        if d2 <= r2:
+            hit[off] = 1
+            hits += 1
+            sum_x += px[off]
+            sum_y += py[off]
+        else:
+            hit[off] = 0
+
+    out.hits = hits.to_f32()
+    out.closest_dist = sqrt(min_d2)
+    out.centroid_x = (sum_x / hits.to_f32()) if hits > 0 else qx
+    out.centroid_y = (sum_y / hits.to_f32()) if hits > 0 else qy
+    return hits
+# endregion
+
+# region 2 soa_arena_allocation_and_sync
+runtime = mod.instantiate()
+arena = SoAArena(
+    {"px": "f32", "py": "f32", "hit": "i32"},
+    max_capacity=CAP,
+    wasm_runtime=runtime,
+    spatial_chunk_fields=("px", "py", "px", "py", "px"),
+)
+
+block_a = arena.alloc(64)
+block_b = arena.alloc(64)
+
+for i in range(arena.cursor):
+    angle = i * 0.15
+    arena["px"][i] = 200.0 + math.cos(angle) * (30.0 + i * 0.8)
+    arena["py"][i] = 200.0 + math.sin(angle) * (30.0 + i * 0.8)
+
+arena.sync_range_to_wasm(0, arena.cursor, ["px", "py"])
+arena.free(block_a, 16)
+
+hit_count = runtime["query_particles"](arena.cursor, 200.0, 200.0, 75.0)
+query_summary = runtime["out_struct"].to_dict()
+
+print(f"Arena Cursor: {arena.cursor} | Reclaimable Holes: {arena.reclaimable}")
+print(f"NumPy Chunk0 Bounds X: [{arena.chunkMinX[0]:.1f}, {arena.chunkMaxX[0]:.1f}]")
+print(f"Particles inside radius: {hit_count}")
+print("Query StructOut:", query_summary)
+# endregion`
+      },
+      {
+        id: 'ex3_prng_mandelbrot',
+        title: 'Example 3: Stateless PRNG Monte Carlo Pi & Mandelbrot',
+        code: `# region 1 monte_carlo_and_mandelbrot_kernels
+mod = WasmModule(align_bytes=16)
+
+escape_counts = mod.array("escape_counts", "i32", 128)
+mc_out = mod.struct_out("mc_out", ["inside_circle", "pi_estimate"], dtype="f32")
+
+@mod.kernel(ret="f32", samples="i32", seed="i32")
+def estimate_pi(samples, seed):
+    inside: i32 = 0
+    for i in range(0, samples):
+        h: i32 = murmur_hash32(seed, i)
+        rx: f32 = (h & 65535).to_f32() / 65535.0
+        ry: f32 = (shr_u(h, 16) & 65535).to_f32() / 65535.0
+        if (rx * rx + ry * ry) <= 1.0:
+            inside += 1
+
+    pi_est: f32 = (4.0 * inside.to_f32()) / samples.to_f32()
+    mc_out.inside_circle = inside.to_f32()
+    mc_out.pi_estimate = pi_est
+    return pi_est
+
+@mod.kernel(ret="i32", width="i32", cy="f32", max_iter="i32")
+def mandelbrot_row(width, cy, max_iter):
+    total_iters: i32 = 0
+    for x in range(0, width):
+        cx: f32 = -2.0 + (x.to_f32() / width.to_f32()) * 3.0
+        zx: f32 = cx
+        zy: f32 = cy
+        it: i32 = 0
+
+        while it < max_iter:
+            zx2: f32 = zx * zx
+            zy2: f32 = zy * zy
+            if (zx2 + zy2) > 4.0:
+                break
+            zy = 2.0 * zx * zy + cy
+            zx = zx2 - zy2 + cx
+            it += 1
+
+        escape_counts[x] = it
+        total_iters += it
+    return total_iters
+# endregion
+
+# region 2 kernel_invocation_and_readback
+runtime = mod.instantiate()
+
+pi_val = runtime["estimate_pi"](50000, 1337)
+total_mandel_iters = runtime["mandelbrot_row"](64, 0.0, 100)
+
+print(f"Monte Carlo Pi Estimate (50,000 samples): {pi_val:.5f}")
+print(f"Mandelbrot Row Total Iterations: {total_mandel_iters}")
+print("First 12 Mandelbrot Escape Counts:", [int(runtime["escape_counts"][i]) for i in range(12)])
+# endregion`
+      }
+    ];
+
+    const BUILTIN_EXPR_EXAMPLES = [
+      {
+        id: 'expr1_simd_select',
+        title: 'Expr 1: SIMD FMA + Horizontal any_true + Branchless select',
+        expr: 'select(a > b, (arr.v128[byte_offset(i)] * a.splat() + v1).any_true().to_f32(), 0.0)'
+      },
+      {
+        id: 'expr2_murmur_norm',
+        title: 'Expr 2: Stateless PRNG Bit-Mixer (murmur_hash32 -> Clamped f32)',
+        expr: '((murmur_hash32(i, j) & 65535).to_f32() / 65535.0).clamp(0.0, 1.0)'
+      },
+      {
+        id: 'expr3_simd_sqrt_clamp',
+        title: 'Expr 3: 4-Wide v128 Vector Abs + Sqrt + Clamped Bias',
+        expr: '(arr.v128[byte_offset(i)].abs().sqrt() + b.splat()).clamp(0.0, 100.0)'
+      },
+      {
+        id: 'expr4_sympy_cse_poly',
+        title: 'Expr 4: Polynomial Scalar Expression (with SymPy Horner & CSE)',
+        expr: '(a + b) * (a + b) + 3.0 * (a + b) + a * a'
+      }
+    ];
+    // # endregion
+
+    // # region 11 comlink_web_worker_and_codemirror_helpers
+    function createComlinkWasmWorker() {
+      const workerCode = `
+        import * as Comlink from 'https://esm.sh/comlink@4.4.2';
+
+        const workerApi = {
+          async executeWasmExport(wasmB64, fnName, args, iterations = 1) {
+            const binStr = atob(wasmB64);
+            const bytes = new Uint8Array(binStr.length);
+            for (let i = 0; i < binStr.length; i++) bytes[i] = binStr.charCodeAt(i);
+
+            const mod = new WebAssembly.Module(bytes);
+            const inst = new WebAssembly.Instance(mod);
+            const fn = inst.exports[fnName];
+            if (typeof fn !== 'function') {
+              throw new Error("Export '" + fnName + "' not found in Worker WASM instance.");
+            }
+            const t0 = performance.now();
+            let ret = null;
+            const reps = Math.max(1, iterations | 0);
+            for (let r = 0; r < reps; r++) {
+              ret = fn(...args);
+            }
+            const dtUs = ((performance.now() - t0) * 1000.0) / reps;
+            return {
+              fn_name: fnName,
+              args,
+              iterations: reps,
+              return_value: ret,
+              avg_latency_us: Number(dtUs.toFixed(2)),
+              thread: 'Comlink Web Worker'
+            };
+          }
+        };
+
+        Comlink.expose(workerApi);
+      `;
+      const blob = new Blob([workerCode], { type: 'application/javascript' });
+      const worker = new Worker(URL.createObjectURL(blob), { type: 'module' });
+      return Comlink.wrap(worker);
+    }
+
+    // CodeMirror 6 widget showing emitted WASM byte/op counts or inline error per Python line
+    class LineWasmBadgeWidget extends WidgetType {
+      constructor(info) {
+        super();
+        this.info = info;
+      }
+      toDOM() {
+        const span = document.createElement('span');
+        span.className = 'cm-wasm-badge';
+        const simdTag = this.info.simd > 0 ? `, ${this.info.simd} SIMD` : '';
+        span.textContent = `→ ${this.info.ops} op (${this.info.bytes}B${simdTag})`;
+        return span;
+      }
+    }
+
+    class LineErrorBadgeWidget extends WidgetType {
+      constructor(errText) {
+        super();
+        this.errText = errText;
+      }
+      toDOM() {
+        const span = document.createElement('span');
+        span.className = 'cm-error-badge';
+        span.textContent = `✗ ${this.errText}`;
+        return span;
+      }
+    }
+
+    const setLineDiagnosticsEffect = StateEffect.define();
+    const lineDiagnosticsField = StateField.define({
+      create() {
+        return Decoration.none;
+      },
+      update(deco, tr) {
+        deco = deco.map(tr.changes);
+        for (const e of tr.effects) {
+          if (e.is(setLineDiagnosticsEffect)) {
+            const decos = [];
+            const { lineCounts = {}, errorReport = null } = e.value || {};
+            const doc = tr.state.doc;
+
+            for (const [lineStr, info] of Object.entries(lineCounts)) {
+              const lineNo = parseInt(lineStr, 10);
+              if (lineNo >= 1 && lineNo <= doc.lines) {
+                const lineObj = doc.line(lineNo);
+                decos.push(
+                  Decoration.widget({
+                    widget: new LineWasmBadgeWidget(info),
+                    side: 1
+                  }).range(lineObj.to)
+                );
+              }
+            }
+
+            if (errorReport && errorReport.lineno) {
+              const errLine = parseInt(errorReport.lineno, 10);
+              if (errLine >= 1 && errLine <= doc.lines) {
+                const lineObj = doc.line(errLine);
+                decos.push(Decoration.line({ class: 'cm-error-line' }).range(lineObj.from));
+                decos.push(
+                  Decoration.widget({
+                    widget: new LineErrorBadgeWidget(`${errorReport.error_type}: ${errorReport.message.slice(0, 65)}`),
+                    side: 1
+                  }).range(lineObj.to)
+                );
+              }
+            }
+
+            decos.sort((a, b) => a.from - b.from || a.startSide - b.startSide);
+            deco = Decoration.set(decos, true);
+          }
+        }
+        return deco;
+      },
+      provide: f => EditorView.decorations.from(f)
+    });
+
+    function b64ToUint8Array(b64) {
+      const binStr = atob(b64);
+      const bytes = new Uint8Array(binStr.length);
+      for (let i = 0; i < binStr.length; i++) bytes[i] = binStr.charCodeAt(i);
+      return bytes;
+    }
+
+    function uint8ArrayToB64(u8) {
+      let s = '';
+      for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
+      return btoa(s);
+    }
+    // # endregion
+
+    // # region 12 frontend_application_component
+    function App() {
+      const [pyodide, setPyodide] = createSignal(null);
+      const [status, setStatus] = createSignal('Loading Pyodide & Packages...');
+      const [dark, setDark] = createSignal(true);
+      const [tab, setTab] = createSignal('compiler');
+
+      const [selectedExampleId, setSelectedExampleId] = createSignal(BUILTIN_PYTHON_EXAMPLES[0].id);
+      const [userCode, setUserCode] = createSignal(BUILTIN_PYTHON_EXAMPLES[0].code);
+      const [compileResult, setCompileResult] = createSignal(null);
+      const [errorReport, setErrorReport] = createSignal(null);
+      const [eventLogs, setEventLogs] = createSignal([]);
+      const [logFilter, setLogFilter] = createSignal('ALL');
+
+      const [fnArgsInput, setFnArgsInput] = createSignal({});
+      const [lastInvokeResult, setLastInvokeResult] = createSignal(null);
+      const [copiedB64, setCopiedB64] = createSignal(false);
+
+      const [wabtInstance, setWabtInstance] = createSignal(null);
+      const [wabtStatus, setWabtStatus] = createSignal(null);
+      const [binaryenStats, setBinaryenStats] = createSignal(null);
+      const [disasmMode, setDisasmMode] = createSignal('annotated');
+      const [fuzzResult, setFuzzResult] = createSignal(null);
+      const [workerProxy, setWorkerProxy] = createSignal(null);
+
+      const [selectedExprId, setSelectedExprId] = createSignal(BUILTIN_EXPR_EXAMPLES[0].id);
+      const [exprInput, setExprInput] = createSignal(BUILTIN_EXPR_EXAMPLES[0].expr);
+      const [exprResult, setExprResult] = createSignal(null);
+      const [lebInput, setLebInput] = createSignal(-12345);
+      const [lebResult, setLebResult] = createSignal(null);
+
+      let fileInputRef = null;
+      let pyEditorView = null;
+      let watEditorView = null;
+
+      const appendJsLog = (level, phase, message, line = null) => {
+        const now = new Date().toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        setEventLogs(prev => [...prev, { time: now, level, phase, message, line }]);
+      };
+
+      const mergeCompilerLogs = (pyLogs = []) => {
+        const now = new Date().toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        const formatted = pyLogs.map(item => ({
+          time: now,
+          level: item.level || 'INFO',
+          phase: item.phase || 'PY',
+          message: item.message || '',
+          line: item.line || null
+        }));
+        setEventLogs(prev => [...prev, ...formatted]);
+      };
+
+      const bindValue = (getter) => (el) => {
+        const initVal = String(getter() ?? '');
+        if (el.value !== initVal) el.value = initVal;
+        createEffect(
+          () => String(getter() ?? ''),
+          (val) => {
+            if (el.value !== val) el.value = val;
+          }
+        );
+      };
+
+      // SolidJS 2.0 two-phase createEffect(compute, apply)
+      createEffect(
+        () => dark(),
+        (isDark) => {
+          document.documentElement.classList.toggle('dark', isDark);
+          document.body.classList.toggle('dark', isDark);
+        }
+      );
+
+      const jumpToEditorLine = (lineNo) => {
+        if (!pyEditorView || !lineNo) return;
+        const doc = pyEditorView.state.doc;
+        const clamped = Math.max(1, Math.min(doc.lines, parseInt(lineNo, 10)));
+        const lineObj = doc.line(clamped);
+        pyEditorView.dispatch({
+          selection: { anchor: lineObj.from, head: lineObj.to },
+          effects: EditorView.scrollIntoView(lineObj.from, { y: 'center' })
+        });
+        pyEditorView.focus();
+      };
+
+      const inspectWithWabtAndBinaryen = (wasmB64, wModInstance) => {
+        if (!wasmB64) {
+          setWabtStatus(null);
+          setBinaryenStats(null);
+          return;
+        }
+        const rawBytes = b64ToUint8Array(wasmB64);
+
+        const wabtApi = wModInstance || wabtInstance();
+        if (wabtApi) {
+          try {
+            const parsed = wabtApi.readWasm(rawBytes, { readDebugNames: true, simd: true });
+            parsed.validate();
+            const watText = parsed.toText({ foldExprs: false, inlineExport: true });
+            parsed.destroy();
+            setWabtStatus({ valid: true, wat: watText, error: null });
+            appendJsLog('PASS', 'WABT', `Validated WebAssembly module (${rawBytes.length} bytes, SIMD enabled).`);
+          } catch (wErr) {
+            setWabtStatus({ valid: false, wat: '', error: wErr.message });
+            appendJsLog('ERROR', 'WABT', `WABT validation failed: ${wErr.message}`);
+          }
+        }
+
+        try {
+          const bMod = binaryen.readBinary(rawBytes);
+          bMod.setFeatures(binaryen.Features.All);
+          const unoptWat = bMod.emitText();
+          bMod.optimize();
+          const optBytes = bMod.emitBinary();
+          const optWat = bMod.emitText();
+          bMod.dispose();
+
+          const saved = rawBytes.length - optBytes.length;
+          const pct = rawBytes.length > 0 ? ((saved / rawBytes.length) * 100).toFixed(1) : '0.0';
+          appendJsLog('OPT', 'BINARYEN', `wasm-opt -O3 ready: ${rawBytes.length}B → ${optBytes.length}B (-${saved}B / ${pct}%).`);
+
+          setBinaryenStats({
+            rawSize: rawBytes.length,
+            optSize: optBytes.length,
+            optB64: uint8ArrayToB64(optBytes),
+            unoptWat,
+            optWat,
+            applied: false
+          });
+        } catch (bErr) {
+          setBinaryenStats({ error: bErr.message });
+          appendJsLog('WARN', 'BINARYEN', `Binaryen inspection warning: ${bErr.message}`);
+        }
+      };
+
+      const formatDisassemblyText = () => {
+        const res = compileResult();
+        if (!res || !res.functions?.length) return ';; No functions compiled';
+        const mode = disasmMode();
+        if (mode === 'wabt' && wabtStatus()?.wat) {
+          return wabtStatus().wat;
+        }
+        if (mode === 'binaryen' && binaryenStats()?.optWat) {
+          return binaryenStats().optWat;
+        }
+        return res.functions.map(fn => {
+          const header = `(func $${fn.name} (param ${fn.params.join(' ')}) (result ${fn.ret})`;
+          const body = fn.instructions.map(ins => {
+            const off = `+0x${ins.offset.toString(16).padStart(2, '0')}`;
+            const hx = ins.hex.padEnd(14, ' ');
+            const lineComment = ins.py_line ? `  ;; L${ins.py_line}: ${ins.py_src}` : '';
+            return `  ${off}  ${hx} ${ins.text.padEnd(28, ' ')}${lineComment}`;
+          }).join('\n');
+          return `${header}\n${body}\n)`;
+        }).join('\n\n');
+      };
+
+      // Defer CodeMirror DOM creation via queueMicrotask so @solidjs/html finishes template traversal first,
+      // and always re-mount onto the new `hostEl` when switching tabs or re-rendering sections.
+      const mountPythonEditor = (hostEl) => {
+        let localView = null;
+        queueMicrotask(() => {
+          if (!hostEl || !hostEl.isConnected) return;
+          if (pyEditorView) {
+            pyEditorView.destroy();
+            pyEditorView = null;
+          }
+          hostEl.innerHTML = '';
+          const state = EditorState.create({
+            doc: userCode(),
+            extensions: [
+              lineNumbers(),
+              python(),
+              lineDiagnosticsField,
+              keymap.of([
+                {
+                  key: 'Mod-Enter',
+                  run: () => {
+                    handleCompileUserCode();
+                    return true;
+                  }
+                },
+                indentWithTab,
+                ...defaultKeymap
+              ]),
+              EditorView.updateListener.of((update) => {
+                if (update.docChanged) {
+                  const nextDoc = update.state.doc.toString();
+                  if (nextDoc !== userCode()) {
+                    setUserCode(nextDoc);
+                  }
+                }
+              })
+            ]
+          });
+          localView = new EditorView({ state, parent: hostEl });
+          pyEditorView = localView;
+
+          localView.dispatch({
+            effects: setLineDiagnosticsEffect.of({
+              lineCounts: compileResult()?.line_byte_counts || {},
+              errorReport: errorReport()
+            })
+          });
+        });
+
+        createEffect(
+          () => userCode(),
+          (codeVal) => {
+            const activeView = localView || pyEditorView;
+            if (!activeView) return;
+            const currentDoc = activeView.state.doc.toString();
+            if (currentDoc !== codeVal) {
+              activeView.dispatch({
+                changes: { from: 0, to: currentDoc.length, insert: codeVal }
+              });
+            }
+          }
+        );
+
+        createEffect(
+          () => ({
+            lineCounts: compileResult()?.line_byte_counts || {},
+            errorReport: errorReport()
+          }),
+          (diagPayload) => {
+            const activeView = localView || pyEditorView;
+            if (!activeView) return;
+            activeView.dispatch({
+              effects: setLineDiagnosticsEffect.of(diagPayload)
+            });
+          }
+        );
+      };
+
+      const mountWatViewer = (hostEl) => {
+        let localView = null;
+        queueMicrotask(() => {
+          if (!hostEl || !hostEl.isConnected) return;
+          if (watEditorView) {
+            watEditorView.destroy();
+            watEditorView = null;
+          }
+          hostEl.innerHTML = '';
+          const state = EditorState.create({
+            doc: formatDisassemblyText(),
+            extensions: [
+              lineNumbers(),
+              wast(),
+              EditorState.readOnly.of(true)
+            ]
+          });
+          localView = new EditorView({ state, parent: hostEl });
+          watEditorView = localView;
+        });
+
+        createEffect(
+          () => formatDisassemblyText(),
+          (watText) => {
+            const activeView = localView || watEditorView;
+            if (!activeView) return;
+            const cur = activeView.state.doc.toString();
+            if (cur !== watText) {
+              activeView.dispatch({
+                changes: { from: 0, to: cur.length, insert: watText }
+              });
+            }
+          }
+        );
+      };
+
+      const runCodeWithPy = (py, codeStr, wModInstance) => {
+        try {
+          setErrorReport(null);
+          setLastInvokeResult(null);
+          setFuzzResult(null);
+          setCopiedB64(false);
+
+          const res = py.globals.get('compile_playground_code')(codeStr).toJs({ dict_converter: Object.fromEntries });
+          mergeCompilerLogs(res.compiler_logs || []);
+
+          if (!res.ok) {
+            setErrorReport(res.error_report || {
+              error_type: 'CompileError',
+              message: 'Unknown compilation error',
+              lineno: null,
+              col_offset: null,
+              kernel_name: null,
+              excerpt: '',
+              traceback: ''
+            });
+            if (res.stdout) {
+              setCompileResult(prev => prev ? { ...prev, stdout: res.stdout } : null);
+            }
+            if (res.error_report?.lineno) {
+              jumpToEditorLine(res.error_report.lineno);
+            }
+            return;
+          }
+
+          setCompileResult(res);
+          inspectWithWabtAndBinaryen(res.wasm_b64, wModInstance);
+
+          const initialArgs = {};
+          if (res.functions) {
+            for (const fn of res.functions) {
+              initialArgs[fn.name] = fn.params.map((t, idx) => {
+                const pName = fn.param_names?.[idx] || '';
+                if (pName === 'n' || pName === 'width' || pName === 'samples') return '64';
+                if (pName === 'alpha' || pName === 'radius') return '2.5';
+                if (pName === 'max_iter') return '50';
+                return '0';
+              });
+            }
+          }
+          setFnArgsInput(initialArgs);
+        } catch (err) {
+          appendJsLog('ERROR', 'BRIDGE', err.message);
+          setErrorReport({
+            error_type: 'BridgeError',
+            message: err.message,
+            lineno: null,
+            col_offset: null,
+            kernel_name: null,
+            excerpt: '',
+            traceback: err.stack || ''
+          });
+        }
+      };
+
+      // SolidJS 2.0 onSettled lifecycle hook
+      onSettled(() => {
+        let mounted = true;
+        async function init() {
+          try {
+            appendJsLog('INFO', 'INIT', 'Starting Comlink Web Worker, WABT, and Pyodide runtime...');
+            const comlinkWorker = createComlinkWasmWorker();
+            setWorkerProxy(() => comlinkWorker);
+
+            const [py, wMod] = await Promise.all([
+              loadPyodide(),
+              wabt().catch(() => null)
+            ]);
+            if (!mounted) return;
+            setWabtInstance(wMod);
+
+            setStatus('Loading numpy, sympy & micropip packages...');
+            await py.loadPackage(['numpy', 'sympy', 'micropip']);
+            await py.runPythonAsync(`
+import micropip
+await micropip.install(['asttokens', 'gast', 'beniget', 'hypothesis'])
+`);
+            if (!mounted) return;
+            appendJsLog('PASS', 'INIT', 'Loaded Python packages: numpy, sympy, asttokens, gast, beniget, hypothesis.');
+
+            const libCode = document.getElementById('python-compiler-lib').textContent;
+            const bridgeCode = document.getElementById('python-disassembler-bridge').textContent;
+            const fullSource = libCode + '\n' + bridgeCode;
+
+            py.globals.set('_FULL_APPLICATION_SOURCE', fullSource);
+            await py.runPythonAsync(`
+import linecache
+_lines = [line + "\\n" for line in _FULL_APPLICATION_SOURCE.splitlines()]
+linecache.cache["<app_init>"] = (len(_FULL_APPLICATION_SOURCE), None, _lines, "<app_init>")
+exec(compile(_FULL_APPLICATION_SOURCE, "<app_init>", "exec"), globals())
+`);
+            runCodeWithPy(py, BUILTIN_PYTHON_EXAMPLES[0].code, wMod);
+
+            const eRes = py.globals.get('inspect_single_expr')(BUILTIN_EXPR_EXAMPLES[0].expr).toJs({ dict_converter: Object.fromEntries });
+            setExprResult(eRes);
+
+            const lRes = py.globals.get('encode_leb_demo')(-12345).toJs({ dict_converter: Object.fromEntries });
+            setLebResult(lRes);
+
+            setPyodide(py);
+            setStatus('Ready');
+          } catch (err) {
+            appendJsLog('ERROR', 'INIT', err.message);
+            setStatus('Error: ' + err.message);
+          }
+        }
+        init();
+        return () => { mounted = false; };
+      });
+
+      const handleCompileUserCode = () => {
+        const py = pyodide();
+        if (!py) return;
+        runCodeWithPy(py, userCode());
+      };
+
+      const handleApplyBinaryenOptimization = () => {
+        const py = pyodide();
+        const bStats = binaryenStats();
+        if (!py || !bStats?.optB64) return;
+        try {
+          const snap = py.globals.get('apply_optimized_wasm_b64')(bStats.optB64).toJs({ dict_converter: Object.fromEntries });
+          mergeCompilerLogs(snap.compiler_logs || []);
+          setCompileResult(prev => prev ? ({
+            ...prev,
+            wasm_b64: snap.wasm_b64,
+            wasm_size: snap.wasm_size,
+            arrays: snap.arrays,
+            struct_outs: snap.struct_outs,
+            arenas: snap.arenas,
+          }) : prev);
+          setBinaryenStats({ ...bStats, applied: true });
+          setDisasmMode('binaryen');
+        } catch (err) {
+          appendJsLog('ERROR', 'BINARYEN', err.message);
+        }
+      };
+
+      const handleSelectExample = (e) => {
+        const id = e.target.value;
+        setSelectedExampleId(id);
+        if (id === 'custom') {
+          setUserCode('');
+          setCompileResult(null);
+          setErrorReport(null);
+          setLastInvokeResult(null);
+          setFuzzResult(null);
+          return;
+        }
+        const found = BUILTIN_PYTHON_EXAMPLES.find(ex => ex.id === id);
+        if (found) {
+          setUserCode(found.code);
+          const py = pyodide();
+          if (py) runCodeWithPy(py, found.code);
+        }
+      };
+
+      const handleInvokeFunction = (fnName) => {
+        const py = pyodide();
+        if (!py) return;
+        try {
+          setErrorReport(null);
+          const rawArgs = (fnArgsInput() || {})[fnName] || [];
+          const res = py.globals.get('invoke_active_wasm_function')(fnName, rawArgs).toJs({ dict_converter: Object.fromEntries });
+          appendJsLog('INFO', 'EXEC', `Main Thread: ${res.fn_name}(${res.args.join(', ')}) = ${res.return_value} (${res.latency_us} µs)`);
+          setLastInvokeResult({
+            fn_name: res.fn_name,
+            args: res.args,
+            return_value: res.return_value,
+            latency_us: res.latency_us,
+            thread: 'Main Thread (Shared Memory)'
+          });
+          setCompileResult(prev => prev ? ({
+            ...prev,
+            wasm_b64: res.wasm_b64,
+            arrays: res.arrays,
+            struct_outs: res.struct_outs,
+            arenas: res.arenas,
+          }) : prev);
+        } catch (err) {
+          appendJsLog('ERROR', 'EXEC', err.message);
+          setErrorReport({
+            error_type: 'RuntimeInvokeError',
+            message: err.message,
+            lineno: null,
+            col_offset: null,
+            kernel_name: fnName,
+            excerpt: '',
+            traceback: err.stack || ''
+          });
+        }
+      };
+
+      const handleInvokeComlinkWorker = async (fnName) => {
+        const worker = workerProxy();
+        const b64 = compileResult()?.wasm_b64;
+        if (!worker || !b64) return;
+        try {
+          setErrorReport(null);
+          const rawArgs = ((fnArgsInput() || {})[fnName] || []).map(Number);
+          const wRes = await worker.executeWasmExport(b64, fnName, rawArgs, 100);
+          appendJsLog('PASS', 'WORKER', `Comlink Worker (100x avg): ${wRes.fn_name}(${wRes.args.join(', ')}) = ${wRes.return_value} (${wRes.avg_latency_us} µs)`);
+          setLastInvokeResult({
+            fn_name: wRes.fn_name,
+            args: wRes.args,
+            return_value: wRes.return_value,
+            latency_us: wRes.avg_latency_us,
+            thread: `${wRes.thread} (100-run avg)`
+          });
+        } catch (err) {
+          appendJsLog('ERROR', 'WORKER', err.message);
+          setErrorReport({
+            error_type: 'ComlinkWorkerError',
+            message: err.message,
+            lineno: null,
+            col_offset: null,
+            kernel_name: fnName,
+            excerpt: '',
+            traceback: err.stack || ''
+          });
+        }
+      };
+
+      const handleHypothesisFuzz = (fnName) => {
+        const py = pyodide();
+        if (!py) return;
+        try {
+          setErrorReport(null);
+          const res = py.globals.get('run_hypothesis_fuzz')(fnName, 25).toJs({ dict_converter: Object.fromEntries });
+          appendJsLog('PASS', 'FUZZ', `Hypothesis verified '${fnName}' (${res.examples_run} cases in ${res.elapsed_ms} ms).`);
+          setFuzzResult(res);
+          setCompileResult(prev => prev ? ({
+            ...prev,
+            arrays: res.arrays,
+            struct_outs: res.struct_outs,
+            arenas: res.arenas,
+          }) : prev);
+        } catch (err) {
+          appendJsLog('ERROR', 'FUZZ', err.message);
+          setErrorReport({
+            error_type: 'HypothesisFuzzFailure',
+            message: err.message,
+            lineno: null,
+            col_offset: null,
+            kernel_name: fnName,
+            excerpt: '',
+            traceback: err.stack || ''
+          });
+        }
+      };
+
+      const handleFileUpload = (e) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+          setSelectedExampleId('custom');
+          setUserCode(String(ev.target?.result || ''));
+          appendJsLog('INFO', 'FILE', `Loaded file '${file.name}'.`);
+        };
+        reader.readAsText(file);
+        e.target.value = '';
+      };
+
+      const handleCopyBase64 = () => {
+        const b64 = compileResult()?.wasm_b64;
+        if (!b64) return;
+        navigator.clipboard.writeText(b64);
+        setCopiedB64(true);
+        appendJsLog('INFO', 'EMIT', `Copied Base64 WASM string (${b64.length} chars) to clipboard.`);
+        setTimeout(() => setCopiedB64(false), 1500);
+      };
+
+      const handleDownloadWasm = () => {
+        const b64 = compileResult()?.wasm_b64;
+        if (!b64) return;
+        const bytes = b64ToUint8Array(b64);
+        const blob = new Blob([bytes], { type: 'application/wasm' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'module.wasm';
+        a.click();
+        URL.revokeObjectURL(url);
+        appendJsLog('INFO', 'EMIT', `Downloaded module.wasm (${bytes.length} bytes).`);
+      };
+
+      const handleInspectExpr = (val) => {
+        setExprInput(val);
+        const py = pyodide();
+        if (!py || !val.trim()) {
+          setExprResult(null);
+          return;
+        }
+        try {
+          const res = py.globals.get('inspect_single_expr')(val).toJs({ dict_converter: Object.fromEntries });
+          setExprResult(res);
+        } catch (e) {
+          setExprResult({ error: e.message });
+        }
+      };
+
+      const handleSelectExprExample = (e) => {
+        const id = e.target.value;
+        setSelectedExprId(id);
+        if (id === 'custom') {
+          handleInspectExpr('');
+          return;
+        }
+        const found = BUILTIN_EXPR_EXAMPLES.find(item => item.id === id);
+        if (found) {
+          handleInspectExpr(found.expr);
+        }
+      };
+
+      const handleLebChange = (val) => {
+        const num = parseInt(val, 10) || 0;
+        setLebInput(num);
+        const py = pyodide();
+        if (!py) return;
+        const res = py.globals.get('encode_leb_demo')(num).toJs({ dict_converter: Object.fromEntries });
+        setLebResult(res);
+      };
+
+      const filteredLogs = () => {
+        const f = logFilter();
+        const all = eventLogs();
+        if (f === 'ALL') return all;
+        if (f === 'WARN_ERR') return all.filter(l => l.level === 'ERROR' || l.level === 'WARN');
+        if (f === 'OPT_PASS') return all.filter(l => l.level === 'OPT' || l.level === 'PASS');
+        return all;
+      };
+
+      return html`
+        <div>
+          ${() => !pyodide() ? html`<fieldset><legend>Initializing PyWASM</legend><div>${() => status()}</div></fieldset>` : html`
+            <div>
+              <div class="bar">
+                <strong>PyWASM</strong>
+                <span>${() => `[${status()}]`}</span>
+                <button
+                  onClick=${() => setTab('compiler')}
+                  style=${() => `font-weight: ${tab() === 'compiler' ? 'bold' : 'normal'}`}
+                >
+                  1. Python Compiler
+                </button>
+                <button
+                  onClick=${() => setTab('ast')}
+                  style=${() => `font-weight: ${tab() === 'ast' ? 'bold' : 'normal'}`}
+                >
+                  2. Expr, SymPy CSE & LEB128
+                </button>
+                <button onClick=${() => setDark(!dark())}>
+                  ${() => `Theme: ${dark() ? 'Dark' : 'Light'}`}
+                </button>
+              </div>
+
+              ${() => tab() === 'compiler' ? html`
+                <div class="layout-grid">
+                  <!-- LEFT COLUMN: PYTHON EDITOR, STATIC AST ANALYSIS, EVENT LOG CONSOLE -->
+                  <div class="layout-col">
+                    <fieldset>
+                      <legend>Python Code (CodeMirror 6 + asttokens WASM Badges)</legend>
+                      <div class="bar">
+                        <select ref=${bindValue(selectedExampleId)} onChange=${handleSelectExample}>
+                          ${BUILTIN_PYTHON_EXAMPLES.map(ex => html`
+                            <option value=${ex.id}>${ex.title}</option>
+                          `)}
+                          <option value="custom">-- Custom / Blank --</option>
+                        </select>
+                        <button onClick=${handleCompileUserCode}>Compile & Run (Ctrl+Enter)</button>
+                        <input
+                          ref=${(el) => { fileInputRef = el; }}
+                          type="file"
+                          accept=".py,.txt"
+                          onChange=${handleFileUpload}
+                          style="display:none"
+                        />
+                        <button onClick=${() => fileInputRef?.click()}>Load .py</button>
+                        <button onClick=${() => {
+                          setSelectedExampleId('custom');
+                          setUserCode('');
+                          setCompileResult(null);
+                          setErrorReport(null);
+                        }}>Clear</button>
+                      </div>
+                      <div class="cm-host-py" ref=${mountPythonEditor}></div>
+                    </fieldset>
+
+                    ${() => {
+                      const res = compileResult();
+                      if (!res || !res.functions?.length) return null;
+                      return html`
+                        <fieldset>
+                          <legend>Static AST Analysis (SymPy + Gast/Beniget)</legend>
+                          ${res.functions.map(fn => html`
+                            <div style="margin-bottom:6px">
+                              <div><strong>${`Kernel $${fn.name}:`}</strong></div>
+                              ${fn.sympy_rewrites?.length > 0 ? fn.sympy_rewrites.map(rw => html`
+                                <div>
+                                  <span>${`• SymPy Horner/Simplify (L${rw.line}): `}</span>
+                                  <code>${rw.original}</code>
+                                  <span> → </span>
+                                  <code>${rw.simplified}</code>
+                                </div>
+                              `) : html`<div>• SymPy: No reducible scalar polynomials detected</div>`}
+                              ${fn.beniget_report?.enabled ? html`
+                                <div>
+                                  <span>• Beniget Def-Use: </span>
+                                  <span>${fn.beniget_report.defs.map(d => `${d.symbol}(${d.uses} uses)`).join(', ')}</span>
+                                  <span>${fn.beniget_report.dead_locals?.length > 0
+                                    ? ` | Dead Locals: ${fn.beniget_report.dead_locals.join(', ')}`
+                                    : ' | 0 Dead Locals'}</span>
+                                  <span>${fn.beniget_report.loop_invariants?.length > 0
+                                    ? ` | Loop-Invariants: [${fn.beniget_report.loop_invariants.join(', ')}]`
+                                    : ''}</span>
+                                </div>
+                              ` : null}
+                            </div>
+                          `)}
+                        </fieldset>
+                      `;
+                    }}
+
+                    <fieldset>
+                      <legend>${() => `Compiler & Execution Log (${filteredLogs().length} entries)`}</legend>
+                      <div class="bar">
+                        <button
+                          onClick=${() => setLogFilter('ALL')}
+                          style=${() => `font-weight: ${logFilter() === 'ALL' ? 'bold' : 'normal'}`}
+                        >All</button>
+                        <button
+                          onClick=${() => setLogFilter('WARN_ERR')}
+                          style=${() => `font-weight: ${logFilter() === 'WARN_ERR' ? 'bold' : 'normal'}`}
+                        >Warnings & Errors</button>
+                        <button
+                          onClick=${() => setLogFilter('OPT_PASS')}
+                          style=${() => `font-weight: ${logFilter() === 'OPT_PASS' ? 'bold' : 'normal'}`}
+                        >Optimizations & Passes</button>
+                        <button onClick=${() => setEventLogs([])}>Clear Log</button>
+                      </div>
+                      <div class="log-console">
+                        ${() => {
+                          const list = filteredLogs();
+                          if (list.length === 0) return html`<div>No log events matching filter.</div>`;
+                          return list.slice().reverse().map(entry => html`
+                            <div class="log-entry">
+                              <span style="opacity:0.6">${entry.time}</span>
+                              <span class=${`log-lvl-${entry.level}`}>${`[${entry.level}:${entry.phase}]`}</span>
+                              ${entry.line ? html`
+                                <button
+                                  style="padding:0 4px;font-size:11px"
+                                  onClick=${() => jumpToEditorLine(entry.line)}
+                                >${`L${entry.line}`}</button>
+                              ` : null}
+                              <span>${entry.message}</span>
+                            </div>
+                          `);
+                        }}
+                      </div>
+                    </fieldset>
+                  </div>
+
+                  <!-- RIGHT COLUMN: ERROR DIAGNOSTICS, BASE64 WASM, EXECUTION, DISASSEMBLY, ARENAS -->
+                  <div class="layout-col">
+                    ${() => {
+                      const err = errorReport();
+                      if (!err) return null;
+                      return html`
+                        <fieldset class="error-box">
+                          <legend>${`Diagnostic Error — ${err.error_type}`}</legend>
+                          <div class="bar">
+                            <strong>${err.message}</strong>
+                            ${err.lineno ? html`
+                              <button onClick=${() => jumpToEditorLine(err.lineno)}>
+                                ${`Jump to Line ${err.lineno}${err.col_offset != null ? `:${err.col_offset}` : ''}`}
+                              </button>
+                            ` : null}
+                            ${err.kernel_name ? html`<span>${`[Kernel: @${err.kernel_name}]`}</span>` : null}
+                            <button onClick=${() => setErrorReport(null)}>Dismiss</button>
+                          </div>
+                          ${err.excerpt ? html`<pre>${err.excerpt}</pre>` : null}
+                          ${err.traceback ? html`<pre>${err.traceback}</pre>` : null}
+                        </fieldset>
+                      `;
+                    }}
+
+                    <fieldset>
+                      <legend>${() => {
+                        const sz = compileResult()?.wasm_size || 0;
+                        const w = wabtStatus();
+                        const wTag = w ? (w.valid ? ' — WABT Valid: PASS' : ' — WABT Valid: FAIL') : '';
+                        return `Base64 WASM Output (${sz} bytes)${wTag}`;
+                      }}</legend>
+                      <div class="bar">
+                        <button disabled=${() => !compileResult()?.wasm_b64} onClick=${handleCopyBase64}>
+                          ${() => copiedB64() ? 'Copied' : 'Copy Base64'}
+                        </button>
+                        <button disabled=${() => !compileResult()?.wasm_b64} onClick=${handleDownloadWasm}>
+                          Download .wasm
+                        </button>
+                        ${() => {
+                          const b = binaryenStats();
+                          if (!b || b.error) return null;
+                          return html`
+                            <button
+                              disabled=${() => b.applied}
+                              onClick=${handleApplyBinaryenOptimization}
+                            >
+                              ${() => b.applied
+                                ? `Binaryen -O3 Applied (${b.optSize}B)`
+                                : `Apply Binaryen -O3 (${b.rawSize}B → ${b.optSize}B)`}
+                            </button>
+                          `;
+                        }}
+                      </div>
+                      <textarea
+                        rows="3"
+                        readonly
+                        ref=${bindValue(() => compileResult()?.wasm_b64 || '')}
+                        placeholder="Base64 encoded .wasm binary will appear here after compilation..."
+                      ></textarea>
+                      ${() => {
+                        const secs = compileResult()?.section_sizes;
+                        if (!secs || Object.keys(secs).length === 0) return null;
+                        return html`
+                          <div style="margin-top:4px;font-size:12px;opacity:0.85">
+                            ${Object.entries(secs).map(([k, v]) => `${k}: ${v}`).join(' | ')}
+                          </div>
+                        `;
+                      }}
+                    </fieldset>
+
+                    ${() => {
+                      const res = compileResult();
+                      if (!res) return null;
+                      return html`
+                        <div>
+                          <fieldset>
+                            <legend>${`Execution Output (${res.elapsed_ms} ms)`}</legend>
+                            ${res.stdout ? html`<pre>${res.stdout}</pre>` : null}
+                            ${Object.keys(res.summary || {}).length > 0 ? html`
+                              <table>
+                                <thead><tr><th>Variable</th><th>Value</th></tr></thead>
+                                <tbody>
+                                  ${Object.entries(res.summary).map(([k, v]) => html`
+                                    <tr><td>${k}</td><td>${Array.isArray(v) ? JSON.stringify(v) : String(v)}</td></tr>
+                                  `)}
+                                </tbody>
+                              </table>
+                            ` : null}
+                          </fieldset>
+
+                          ${res.functions?.length > 0 ? html`
+                            <div>
+                              <fieldset>
+                                <legend>Exported WASM Functions (Main Thread, Comlink Worker & Hypothesis Fuzz)</legend>
+                                ${res.functions.map(fn => html`
+                                  <div class="bar">
+                                    <strong>${`${fn.name}(${fn.params.map((t, i) => `${fn.param_names?.[i] || `p${i}`}:${t}`).join(', ')}) → ${fn.ret}`}</strong>
+                                    ${fn.params.map((ptype, idx) => html`
+                                      <input
+                                        type="number"
+                                        step=${ptype === 'f32' ? 'any' : '1'}
+                                        style="width:66px"
+                                        ref=${bindValue(() => (fnArgsInput()[fn.name] || [])[idx] ?? '0')}
+                                        onInput=${(e) => {
+                                          const curMap = fnArgsInput();
+                                          const cur = [...(curMap[fn.name] || fn.params.map(() => '0'))];
+                                          cur[idx] = e.target.value;
+                                          setFnArgsInput({ ...curMap, [fn.name]: cur });
+                                        }}
+                                      />
+                                    `)}
+                                    <button onClick=${() => handleInvokeFunction(fn.name)}>Call</button>
+                                    <button onClick=${() => handleInvokeComlinkWorker(fn.name)}>Comlink Worker</button>
+                                    <button onClick=${() => handleHypothesisFuzz(fn.name)}>Hypothesis Fuzz</button>
+                                  </div>
+                                `)}
+                                ${() => {
+                                  const inv = lastInvokeResult();
+                                  return inv ? html`
+                                    <pre>${`[${inv.thread}] ${inv.fn_name}(${inv.args.join(', ')}) = ${String(inv.return_value)} (${inv.latency_us} µs)`}</pre>
+                                  ` : null;
+                                }}
+                                ${() => {
+                                  const fz = fuzzResult();
+                                  return fz ? html`
+                                    <pre>${`[Hypothesis] ${fz.fn_name}: ${fz.examples_run} generated cases — ${fz.status} (${fz.elapsed_ms} ms)\nSamples: ${fz.samples.map(s => `${fz.fn_name}(${s.args.join(', ')}) -> ${s.ret}`).join(' | ')}`}</pre>
+                                  ` : null;
+                                }}
+                              </fieldset>
+
+                              <fieldset>
+                                <legend>Disassembly (CodeMirror 6 @codemirror/lang-wast)</legend>
+                                <div class="bar">
+                                  <button
+                                    onClick=${() => setDisasmMode('annotated')}
+                                    style=${() => `font-weight: ${disasmMode() === 'annotated' ? 'bold' : 'normal'}`}
+                                  >
+                                    PyWASM + asttokens Line Map
+                                  </button>
+                                  <button
+                                    onClick=${() => setDisasmMode('wabt')}
+                                    style=${() => `font-weight: ${disasmMode() === 'wabt' ? 'bold' : 'normal'}`}
+                                  >
+                                    WABT Standard WAT
+                                  </button>
+                                  <button
+                                    onClick=${() => setDisasmMode('binaryen')}
+                                    style=${() => `font-weight: ${disasmMode() === 'binaryen' ? 'bold' : 'normal'}`}
+                                  >
+                                    Binaryen -O3 WAT
+                                  </button>
+                                </div>
+                                <div class="cm-host-wat" ref=${mountWatViewer}></div>
+                              </fieldset>
+                            </div>
+                          ` : null}
+
+                          ${(res.struct_outs?.length > 0 || res.arrays?.length > 0 || res.arenas?.length > 0) ? html`
+                            <fieldset>
+                              <legend>Memory, NumPy Stats & SoAArenas</legend>
+                              ${res.struct_outs?.map(so => html`
+                                <div><strong>${`StructOut ${so.name}: `}</strong><span>${JSON.stringify(so.fields)}</span></div>
+                              `)}
+                              ${res.arrays?.map(arr => html`
+                                <div>
+                                  <strong>${`${arr.name} (${arr.dtype}[${arr.capacity}], @${arr.byte_offset}B): `}</strong>
+                                  <span>${`[${arr.preview.join(', ')}${arr.capacity > arr.preview.length ? ', ...' : ''}]${arr.np_stats ? ` | NumPy(min=${arr.np_stats.min}, max=${arr.np_stats.max}, mean=${arr.np_stats.mean})` : ''}`}</span>
+                                </div>
+                              `)}
+                              ${res.arenas?.map(ar => html`
+                                <div>
+                                  <strong>${`SoAArena ${ar.name} (cursor=${ar.cursor}/${ar.capacity}, holes=${ar.reclaimable}, numpy=${String(ar.numpy_backed)}): `}</strong>
+                                  <span>${JSON.stringify(ar.previews)}</span>
+                                </div>
+                              `)}
+                            </fieldset>
+                          ` : null}
+                        </div>
+                      `;
+                    }}
+                  </div>
+                </div>
+              ` : null}
+
+              ${() => tab() === 'ast' ? html`
+                <div class="layout-grid">
+                  <div class="layout-col">
+                    <fieldset>
+                      <legend>Python WASM Expr & SymPy CSE Inspector</legend>
+                      <p>Locals in scope: a, b (f32) | i, j (i32) | v1, v2 (v128) | arr (f32[64])</p>
+                      <div class="bar">
+                        <select ref=${bindValue(selectedExprId)} onChange=${handleSelectExprExample} style="width:100%">
+                          ${BUILTIN_EXPR_EXAMPLES.map(ex => html`
+                            <option value=${ex.id}>${ex.title}</option>
+                          `)}
+                          <option value="custom">-- Custom Expression --</option>
+                        </select>
+                      </div>
+                      <input
+                        type="text"
+                        style="width:100%"
+                        ref=${bindValue(exprInput)}
+                        placeholder="Enter custom Python WASM Expr (e.g. a + b)"
+                        onInput=${(e) => {
+                          setSelectedExprId('custom');
+                          handleInspectExpr(e.target.value);
+                        }}
+                      />
+                      ${() => {
+                        const r = exprResult();
+                        if (!r) return null;
+                        if (r.error) return html`<pre>${r.error}</pre>`;
+                        return html`
+                          <div>
+                            <pre>${`Type: ${r.vtype} | ByteOffset: ${String(r.is_byte_offset)} | Size: ${r.byte_len}B\nBase64: ${r.b64}\nHex:    ${r.hex}\n\n${r.instructions.map(ins => `+0x${ins.offset.toString(16).padStart(2, '0')}  ${ins.hex.padEnd(12, ' ')} ${ins.text}`).join('\n')}`}</pre>
+                            ${r.sympy_info ? html`
+                              <pre>${`SymPy Algebraic Analysis:\n  Simplified: ${r.sympy_info.simplified}\n  Horner:     ${r.sympy_info.horner}\n  CSE Temps:  ${r.sympy_info.cse_temps.length ? r.sympy_info.cse_temps.join(', ') : '(none)'}\n  CSE Output: ${r.sympy_info.cse_result}`}</pre>
+                            ` : null}
+                          </div>
+                        `;
+                      }}
+                    </fieldset>
+                  </div>
+
+                  <div class="layout-col">
+                    <fieldset>
+                      <legend>LEB128 Encoder</legend>
+                      <input
+                        type="number"
+                        style="width:100%"
+                        ref=${bindValue(lebInput)}
+                        onInput=${(e) => handleLebChange(e.target.value)}
+                      />
+                      ${() => {
+                        const l = lebResult();
+                        return l ? html`
+                          <pre>${`Signed   Hex: ${l.s_hex} | Base64: ${l.s_b64}\nUnsigned Hex: ${l.u_hex} | Base64: ${l.u_b64}`}</pre>
+                        ` : null;
+                      }}
+                    </fieldset>
+                  </div>
+                </div>
+              ` : null}
+            </div>
+          `}
+        </div>
+      `;
+    }
+
+    render(App, document.getElementById('app'));
+    // # endregion
+  </script>
+</body>
+</html>
