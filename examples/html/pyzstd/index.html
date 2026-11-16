@@ -1,0 +1,1208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Pyodide 3.14 Zstandard &amp; WebP Converter</title>
+  <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+  <script type="importmap">{"imports":{"solid-js":"https://esm.sh/solid-js@2.0.0-rc.21","solid-js/":"https://esm.sh/solid-js@2.0.0-rc.21/","@solidjs/web":"https://esm.sh/@solidjs/web@2.0.0-rc.21?external=solid-js","@solidjs/web/":"https://esm.sh/@solidjs/web@2.0.0-rc.21/","@solidjs/html":"https://esm.sh/@solidjs/html@2.0.0-rc.21?external=solid-js,@solidjs/web"}}</script>
+  <style type="text/tailwindcss">
+    @layer base {
+      :root { color-scheme: dark; }
+      body { @apply bg-zinc-950 text-zinc-100 font-sans antialiased max-w-6xl mx-auto my-3 px-3 text-xs leading-normal; }
+      label { @apply relative flex flex-col gap-1 text-xs text-zinc-300; }
+      input, select { @apply px-2 py-1 text-xs bg-zinc-950 text-zinc-100 border border-zinc-800 rounded placeholder:text-zinc-600 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500/40 disabled:bg-zinc-900/50 disabled:text-zinc-600 disabled:border-zinc-800/60 disabled:cursor-not-allowed; }
+      input[type="file"] { @apply py-0.5 px-1 file:mr-2 file:py-0.5 file:px-2 file:rounded file:border-0 file:text-[11px] file:font-medium file:bg-zinc-800 file:text-zinc-200 hover:file:bg-zinc-700; }
+    }
+    @layer components {
+      .panel { @apply my-2 px-3 py-2 bg-zinc-900/70 border border-zinc-800 rounded-lg; }
+      .panel-summary { @apply cursor-pointer select-none flex items-center justify-between gap-2 text-xs font-semibold text-zinc-200 list-none; }
+      .panel-summary::-webkit-details-marker { display: none; }
+      .chev { @apply inline-block text-zinc-400 transition-transform duration-150; }
+      details[open] > .panel-summary .chev { @apply rotate-90 text-zinc-200; }
+      .grid-fields { @apply grid grid-cols-[repeat(auto-fill,minmax(185px,1fr))] gap-x-2.5 gap-y-2; }
+      .label-head { @apply flex items-center justify-between gap-1 truncate; }
+      .hint { @apply text-[11px] text-zinc-400 leading-tight; }
+      .btn { @apply px-3 py-1 text-xs font-medium rounded border border-zinc-700 bg-zinc-800 text-zinc-100 cursor-pointer transition-colors hover:bg-zinc-700 disabled:opacity-50 disabled:cursor-not-allowed; }
+      .btn-primary { @apply bg-blue-600 border-blue-500/40 text-white hover:bg-blue-500; }
+      .btn-sm { @apply px-2 py-0.5 text-[11px] font-medium rounded border border-zinc-700 bg-zinc-800 text-zinc-200 cursor-pointer transition-colors hover:bg-zinc-700 disabled:opacity-50 disabled:cursor-not-allowed; }
+      .tip { @apply inline-flex items-center justify-center w-3.5 h-3.5 rounded-full bg-zinc-800 border border-zinc-700 text-zinc-400 text-[10px] font-bold cursor-help select-none shrink-0 hover:bg-blue-500 hover:border-blue-500 hover:text-zinc-950 focus:bg-blue-500 focus:border-blue-500 focus:text-zinc-950 focus:outline-none; }
+      .tip-text { @apply hidden absolute left-0 right-0 bottom-[calc(100%+4px)] z-20 px-2 py-1.5 rounded bg-zinc-900 border border-zinc-700 text-zinc-100 text-[11px] font-normal leading-snug whitespace-normal shadow-xl pointer-events-none; }
+      .tip:hover .tip-text, .tip:focus .tip-text { @apply block; }
+    }
+    #status { @apply text-xs font-semibold text-zinc-200; }
+    #status.error, .error { @apply text-red-400; }
+    #status.warn, .warn { @apply text-amber-400; }
+    #results a { @apply text-blue-400 hover:text-blue-300 hover:underline; }
+    .log-INFO { @apply text-zinc-200; }
+    .log-DEBUG { @apply text-zinc-400; }
+    .log-WARN { @apply text-amber-400; }
+    .log-ERROR { @apply text-red-400; }
+    .log-OK { @apply text-emerald-400; }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+
+  <script id="python-code" type="text/python">
+import asyncio
+import bisect
+import bz2
+import gzip
+import hashlib
+import io
+import lzma
+import mimetypes
+import os
+import struct
+import sys
+import tarfile
+import time
+import traceback
+import zipfile
+import zlib
+from pathlib import Path, PurePosixPath
+from compression import zstd as czstd
+from compression.zstd import CompressionParameter, Strategy, ZstdDict
+import micropip
+import numpy as np
+import PIL
+from PIL import ExifTags, Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps, ImageSequence, ImageStat, features as pil_features
+from js import Blob, Object, Uint8Array, URL, appendLog, document, updateCliPreview
+from pyodide.ffi import create_proxy, to_js
+
+try:
+    from PIL import ImageCms
+except ImportError:
+    ImageCms = None
+
+try:
+    from scipy import ndimage
+except ImportError:
+    ndimage = None
+
+try:
+    from skimage.metrics import structural_similarity as ssim
+except ImportError:
+    ssim = None
+
+try:
+    from tabulate import tabulate
+except ImportError:
+    tabulate = None
+
+ZSTD_KEYS = (
+    "window_log hash_log chain_log search_log min_match target_length "
+    "ldm_hash_log ldm_min_match ldm_bucket_size_log ldm_hash_rate_log "
+    "nb_workers job_size overlap_log content_size_flag checksum_flag "
+    "dict_id_flag enable_long_distance_matching"
+).split()
+CREATED_URLS = []
+log = appendLog
+el = lambda i: document.getElementById(i)
+get_val = lambda i: el(i).value.strip()
+
+def fmt_b(n):
+    for u in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.2f} {u}" if u != "B" else f"{n} B"
+        n /= 1024
+    return f"{n:.2f} TB"
+
+def fmt_metrics(m, include_rmse=True):
+    if m["psnr"] is None:
+        return ""
+    psnr_s = "inf" if m["psnr"] == float("inf") else f"{m['psnr']:.1f}dB"
+    ssim_s = "" if m["ssim"] is None else f" SSIM={m['ssim']:.4f}"
+    rmse_s = f" RMSE={m['rmse']:.2f}" if include_rmse else ""
+    return f", PSNR={psnr_s}{ssim_s}{rmse_s}"
+
+def format_table(rows, headers):
+    if tabulate is not None:
+        return tabulate(rows, headers=headers, tablefmt="github")
+    return "\n".join([" | ".join(headers)] + [" | ".join(str(c) for c in r) for r in rows])
+
+def safe_relpath(name):
+    parts = [p for p in PurePosixPath(name.replace("\\", "/")).parts if p not in ("", "/", ".", "..")]
+    return "/".join(parts) or "file"
+
+def digest_info(data):
+    return hashlib.sha256(data).hexdigest(), zlib.crc32(data) & 0xFFFFFFFF
+
+def guess_mime(name, fallback="application/octet-stream"):
+    if name.endswith(".zst"): return "application/zstd"
+    if name.endswith(".webp"): return "image/webp"
+    return mimetypes.guess_type(name)[0] or fallback
+
+def revoke_urls():
+    if CREATED_URLS:
+        for u in CREATED_URLS:
+            URL.revokeObjectURL(u)
+        log("DEBUG", f"Revoked {len(CREATED_URLS)} previous Blob URL(s).")
+        CREATED_URLS.clear()
+
+def make_url(data, mime):
+    url = URL.createObjectURL(Blob.new(to_js([to_js(data)]), to_js({"type": mime}, dict_converter=Object.fromEntries)))
+    CREATED_URLS.append(url)
+    return url
+
+async def read_bytes(f):
+    return Uint8Array.new(await f.arrayBuffer()).to_bytes()
+
+def add_li(parent, name="", url="", note="", err=""):
+    li = document.createElement("li")
+    if err:
+        li.className = "error"
+        li.textContent = err
+    else:
+        a = document.createElement("a")
+        a.href, a.download, a.textContent = url, Path(name).name, f"Download {name}"
+        li.appendChild(a)
+        li.appendChild(document.createTextNode(note))
+    parent.appendChild(li)
+
+def parse_zstd_header(data):
+    if len(data) < 5 or struct.unpack_from("<I", data, 0)[0] != 0xFD2FB528:
+        return None
+    fhd = data[4]
+    fcs_flag, single, chk, did_flag = (fhd >> 6) & 3, bool((fhd >> 5) & 1), bool((fhd >> 2) & 1), fhd & 3
+    pos = 5 + (0 if single else 1)
+    did_sz = (0, 1, 2, 4)[did_flag]
+    dict_id = None
+    if did_sz and pos + did_sz <= len(data):
+        dict_id = struct.unpack_from("<" + {1: "B", 2: "H", 4: "I"}[did_sz], data, pos)[0]
+        pos += did_sz
+    fcs_sz = (1 if single else 0) if fcs_flag == 0 else (0, 2, 4, 8)[fcs_flag]
+    content_size = None
+    if fcs_sz and pos + fcs_sz <= len(data):
+        content_size = struct.unpack_from("<" + {1: "B", 2: "H", 4: "I", 8: "Q"}[fcs_sz], data, pos)[0] + (256 if fcs_sz == 2 else 0)
+    return {"single_segment": single, "checksum": chk, "dict_id": dict_id, "content_size": content_size}
+
+def parse_webp_chunks(data):
+    if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+        return None
+    riff_size = struct.unpack_from("<I", data, 4)[0]
+    chunks, pos = [], 12
+    while pos + 8 <= len(data):
+        fourcc, sz = struct.unpack_from("<4sI", data, pos)
+        chunks.append((fourcc.decode("ascii", "replace"), sz))
+        pos += 8 + sz + (sz & 1)
+    return {"riff_size": riff_size, "chunks": chunks}
+
+def summarize_exif(img):
+    ex = img.getexif()
+    if not ex:
+        return {}
+    out = {}
+    for tid, val in ex.items():
+        name = ExifTags.TAGS.get(tid, f"0x{tid:04x}")
+        if tid == 0x8825:
+            gps = ex.get_ifd(0x8825)
+            out[name] = {ExifTags.GPSTAGS.get(k, str(k)): repr(v) for k, v in gps.items()} if gps else "present"
+        else:
+            s = repr(val)
+            out[name] = s[:60] + "..." if len(s) > 60 else s
+    return out
+
+def parse_webp_options():
+    bg = get_val("webp_background")
+    if bg:
+        parts = [int(p.strip()) for p in bg.split(",")]
+        if len(parts) != 4 or any(not 0 <= p <= 255 for p in parts):
+            raise ValueError("webp background must be 4 integers (0–255) separated by commas, e.g. 0,0,0,0")
+        bg = tuple(parts)
+    else:
+        bg = None
+    opts = {k: get_val(f"webp_{k}") == "true" for k in ("lossless", "exact", "auto_orient", "to_srgb", "preserve_icc", "preserve_exif", "preserve_xmp", "save_all", "minimize_size", "allow_mixed", "strip_gps", "metrics", "diff_map")}
+    opts.update({k: int(get_val(f"webp_{k}") or d) for k, d in (("quality", 80), ("alpha_quality", 100), ("method", 4), ("max_dim", 0), ("target_kb", 0))})
+    opts.update({k: float(get_val(f"webp_{k}") or d) for k, d in (("contrast", 1.0), ("saturation", 1.0), ("denoise_sigma", 0.0))})
+    opts.update({k: int(v) if (v := get_val(f"webp_{k}")) != "" else None for k in ("loop", "duration")})
+    opts["sharpen"] = get_val("webp_sharpen") or "none"
+    opts["clean_alpha"] = get_val("webp_clean_alpha") or "none"
+    opts["watermark"] = get_val("webp_watermark")
+    opts["background"], opts["non_image"] = bg, get_val("webp_non_image") or "include"
+    return opts
+
+def _norm_mode(frame):
+    if frame.mode in ("RGB", "RGBA"):
+        return frame
+    return frame.convert("RGBA" if frame.mode in ("LA", "PA") or "transparency" in frame.info else "RGB")
+
+def _prep_frame(fr, opts, src_icc=None):
+    has_alpha = fr.mode in ("RGBA", "LA", "PA") or "transparency" in fr.info
+    f = fr.copy()
+    if opts["auto_orient"]:
+        f = ImageOps.exif_transpose(f)
+    if opts["to_srgb"] and src_icc:
+        if ImageCms is not None and pil_features.check("littlecms2"):
+            try:
+                f = _norm_mode(f)
+                src_p = ImageCms.ImageCmsProfile(io.BytesIO(src_icc))
+                dst_p = ImageCms.createProfile("sRGB")
+                f = ImageCms.profileToProfile(f, src_p, dst_p, outputMode=f.mode)
+            except Exception as cms_exc:
+                log("WARN", f"ImageCms sRGB transform skipped: {cms_exc}")
+        else:
+            log("WARN", "ImageCms/littlecms2 not available in this Pillow build; skipping sRGB conversion.")
+    if opts["max_dim"] > 0 and (f.width > opts["max_dim"] or f.height > opts["max_dim"]):
+        f = ImageOps.contain(f, (opts["max_dim"], opts["max_dim"]), Image.Resampling.LANCZOS)
+    f = _norm_mode(f)
+    if abs(opts["contrast"] - 1.0) > 1e-3:
+        f = ImageEnhance.Contrast(f).enhance(opts["contrast"])
+    if abs(opts["saturation"] - 1.0) > 1e-3:
+        f = ImageEnhance.Color(f).enhance(opts["saturation"])
+    if opts["denoise_sigma"] > 0:
+        if ndimage is not None:
+            arr = np.asarray(f, dtype=np.float32)
+            s = opts["denoise_sigma"]
+            out_arr = arr.copy()
+            out_arr[:, :, :3] = ndimage.gaussian_filter(arr[:, :, :3], sigma=(s, s, 0))
+            f = Image.fromarray(np.clip(out_arr, 0, 255).astype(np.uint8), mode=f.mode)
+        else:
+            log("WARN", "scipy.ndimage not loaded; skipping Gaussian denoise.")
+    if opts["sharpen"] == "sharpen":
+        f = f.filter(ImageFilter.SHARPEN)
+    elif opts["sharpen"] == "unsharp":
+        f = f.filter(ImageFilter.UnsharpMask(radius=1.5, percent=120, threshold=3))
+    if opts["clean_alpha"] != "none" and f.mode == "RGBA":
+        arr = np.asarray(f, dtype=np.uint8).copy()
+        if opts["clean_alpha"] == "feather_1px" and ndimage is not None:
+            arr[:, :, 3] = np.clip(ndimage.gaussian_filter(arr[:, :, 3].astype(np.float32), sigma=1.0), 0, 255).astype(np.uint8)
+        elif opts["clean_alpha"] == "threshold_4":
+            arr[arr[:, :, 3] < 4, 3] = 0
+        arr[arr[:, :, 3] == 0, :3] = 0
+        f = Image.fromarray(arr, mode="RGBA")
+    if opts["watermark"]:
+        base_rgba = f.convert("RGBA")
+        overlay = Image.new("RGBA", base_rgba.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+        font = ImageFont.load_default()
+        txt = opts["watermark"]
+        bbox = draw.textbbox((0, 0), txt, font=font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        x, y = max(4, base_rgba.width - tw - 10), max(4, base_rgba.height - th - 10)
+        draw.rectangle((x - 4, y - 2, x + tw + 4, y + th + 2), fill=(0, 0, 0, 120))
+        draw.text((x, y), txt, fill=(255, 255, 255, 220), font=font)
+        f = Image.alpha_composite(base_rgba, overlay)
+        if not has_alpha:
+            f = f.convert("RGB")
+    return f
+
+def calc_quality_metrics(ref_img, webp_bytes):
+    with Image.open(io.BytesIO(webp_bytes)) as dec:
+        dec_f = dec.convert(ref_img.mode)
+        diff = ImageChops.difference(ref_img, dec_f)
+        rmse = float(np.sqrt(np.mean(np.square(ImageStat.Stat(diff).rms))))
+        a = np.asarray(ref_img, dtype=np.float32)
+        b = np.asarray(dec_f, dtype=np.float32)
+        mse = float(np.mean((a - b) ** 2))
+        psnr = float("inf") if mse == 0 else float(20.0 * np.log10(255.0 / np.sqrt(mse)))
+        ssim_val = None
+        if ssim is not None:
+            md = min(a.shape[0], a.shape[1])
+            win = min(7, md if md % 2 == 1 else md - 1)
+            if win >= 3:
+                ssim_val = float(ssim(a[:, :, :3], b[:, :, :3], channel_axis=2, data_range=255.0, win_size=win))
+        return rmse, psnr, ssim_val
+
+def make_diff_image(ref_img, webp_bytes, metrics):
+    with Image.open(io.BytesIO(webp_bytes)) as dec:
+        diff = ImageChops.difference(ref_img.convert("RGB"), dec.convert("RGB"))
+        arr = np.clip(np.asarray(diff, dtype=np.float32) * 8.0, 0, 255).astype(np.uint8)
+        heat = Image.fromarray(arr, mode="RGB")
+        draw = ImageDraw.Draw(heat)
+        font = ImageFont.load_default()
+        label = f"8x Diff{fmt_metrics(metrics, True)}"
+        draw.rectangle((4, 4, min(heat.width - 4, 12 + len(label) * 6), 22), fill=(0, 0, 0))
+        draw.text((8, 7), label, fill=(255, 220, 80), font=font)
+        buf = io.BytesIO()
+        heat.save(buf, format="PNG")
+        return buf.getvalue()
+
+def convert_to_webp(raw, opts):
+    with Image.open(io.BytesIO(raw)) as img:
+        orig_fmt, orig_mode = img.format or "unknown", img.mode
+        n_frames = getattr(img, "n_frames", 1)
+        anim = bool(getattr(img, "is_animated", False) and n_frames > 1) and opts["save_all"]
+        src_icc = img.info.get("icc_profile")
+        kw = {k: opts[k] for k in ("lossless", "quality", "alpha_quality", "method", "exact")}
+        kw["format"] = "WEBP"
+        if opts["preserve_icc"] and src_icc and not opts["to_srgb"]:
+            kw["icc_profile"] = src_icc
+        if opts["preserve_xmp"] and img.info.get("xmp"):
+            kw["xmp"] = img.info["xmp"]
+        if opts["preserve_exif"]:
+            ex = img.getexif()
+            if ex:
+                if opts["strip_gps"]:
+                    ex.pop(0x8825, None)
+                if opts["auto_orient"] and 0x0112 in ex:
+                    ex[0x0112] = 1
+                kw["exif"] = ex.tobytes()
+            elif img.info.get("exif") and not opts["strip_gps"]:
+                kw["exif"] = img.info["exif"]
+
+        frames, durs = [], []
+        for fr in (ImageSequence.Iterator(img) if anim else (img,)):
+            if anim and (d := fr.info.get("duration")) is not None:
+                durs.append(d)
+            frames.append(_prep_frame(fr, opts, src_icc=src_icc))
+        if anim:
+            kw.update(save_all=True, append_images=frames[1:], minimize_size=opts["minimize_size"], allow_mixed=opts["allow_mixed"])
+            if opts["loop"] is not None: kw["loop"] = opts["loop"]
+            elif "loop" in img.info: kw["loop"] = img.info["loop"]
+            if opts["duration"] is not None: kw["duration"] = opts["duration"]
+            elif len(durs) == len(frames) and durs: kw["duration"] = durs
+            if opts["background"] is not None: kw["background"] = opts["background"]
+
+        target_b = opts["target_kb"] * 1024
+        used_q = opts["quality"]
+        if target_b > 0 and not opts["lossless"]:
+            cache = {}
+            def enc_size(q):
+                if q not in cache:
+                    b = io.BytesIO()
+                    frames[0].save(b, **dict(kw, quality=int(q)))
+                    cache[q] = b.getvalue()
+                return len(cache[q])
+            idx = bisect.bisect_right(range(1, 101), target_b, key=enc_size)
+            used_q = max(1, idx)
+            if used_q not in cache:
+                enc_size(used_q)
+            out = cache[used_q]
+        else:
+            buf = io.BytesIO()
+            frames[0].save(buf, **kw)
+            out = buf.getvalue()
+
+        rmse = psnr = ssim_val = None
+        if opts["metrics"] or opts["diff_map"]:
+            rmse, psnr, ssim_val = calc_quality_metrics(frames[0], out)
+        w, h = frames[0].size
+        meta = {"orig_format": orig_fmt, "orig_mode": orig_mode, "final_mode": frames[0].mode, "size": f"{w}x{h}", "frames": n_frames if anim else 1, "used_q": used_q, "rmse": rmse, "psnr": psnr, "ssim": ssim_val}
+        diff_png = make_diff_image(frames[0], out, meta) if opts["diff_map"] else None
+        return out, meta, diff_png
+
+def build_zstd_options():
+    lvl = get_val("compression_level")
+    opts = {CompressionParameter.compression_level: int(lvl) if lvl != "" else 3}
+    if (s := get_val("strategy")):
+        opts[CompressionParameter.strategy] = getattr(Strategy, s)
+    for k in ZSTD_KEYS:
+        if (v := get_val(k)) != "":
+            opts[getattr(CompressionParameter, k)] = int(v)
+    for p, v in opts.items():
+        lo, hi = p.bounds()
+        if not lo <= int(v) <= hi:
+            raise ValueError(f"CompressionParameter.{p.name}={int(v)} is out of valid bounds [{lo}, {hi}] in this runtime")
+    return opts
+
+def unique_name(name, seen):
+    if name not in seen:
+        seen.add(name)
+        return name
+    p = Path(name)
+    i = 2
+    while str(p.with_name(f"{p.stem}_{i}{p.suffix}")) in seen:
+        i += 1
+    u = str(p.with_name(f"{p.stem}_{i}{p.suffix}"))
+    seen.add(u)
+    log("WARN", f"Name collision '{name}' in archive; renamed to '{u}'.")
+    return u
+
+def unpack_archive_bytes(name, raw, zdict=None):
+    low = name.lower()
+    entries = []
+    if low.endswith(".zip") or raw[:4] == b"PK\x03\x04":
+        with zipfile.ZipFile(io.BytesIO(raw), "r") as zf:
+            for zi in zf.infolist():
+                if not zi.is_dir():
+                    entries.append((safe_relpath(zi.filename), zf.read(zi.filename), zi.file_size))
+        return entries
+    tar_raw = None
+    if low.endswith((".tar.zst", ".tzst")) or raw[:4] == b"\x28\xb5\x2f\xfd":
+        dec = czstd.decompress(raw, zstd_dict=zdict)
+        if low.endswith((".tar.zst", ".tzst")) or (len(dec) > 262 and dec[257:262] == b"ustar"):
+            tar_raw = dec
+        else:
+            return [(safe_relpath(Path(name).stem), dec, len(dec))]
+    elif low.endswith((".tar.gz", ".tgz")) or raw[:2] == b"\x1f\x8b":
+        dec = gzip.decompress(raw)
+        if low.endswith((".tar.gz", ".tgz")) or (len(dec) > 262 and dec[257:262] == b"ustar"):
+            tar_raw = dec
+        else:
+            return [(safe_relpath(Path(name).stem), dec, len(dec))]
+    elif low.endswith((".tar.bz2", ".tbz2")) or raw[:3] == b"BZh":
+        dec = bz2.decompress(raw)
+        if low.endswith((".tar.bz2", ".tbz2")) or (len(dec) > 262 and dec[257:262] == b"ustar"):
+            tar_raw = dec
+        else:
+            return [(safe_relpath(Path(name).stem), dec, len(dec))]
+    elif low.endswith((".tar.xz", ".txz")) or raw[:6] == b"\xfd7zXZ\x00":
+        dec = lzma.decompress(raw)
+        if low.endswith((".tar.xz", ".txz")) or (len(dec) > 262 and dec[257:262] == b"ustar"):
+            tar_raw = dec
+        else:
+            return [(safe_relpath(Path(name).stem), dec, len(dec))]
+    elif low.endswith(".tar") or (len(raw) > 262 and raw[257:262] == b"ustar"):
+        tar_raw = raw
+    if tar_raw is not None:
+        with tarfile.open(fileobj=io.BytesIO(tar_raw), mode="r:*") as tf:
+            for m in tf.getmembers():
+                if m.isfile() and (fobj := tf.extractfile(m)):
+                    entries.append((safe_relpath(m.name), fobj.read(), m.mtime))
+        return entries
+    return None
+
+async def collect_inputs(files, unpack, zdict=None):
+    items = []
+    for i in range(files.length):
+        f = files.item(i)
+        rel = getattr(f, "webkitRelativePath", "") or f.name
+        raw = await read_bytes(f)
+        lm = getattr(f, "lastModified", 0)
+        mtime = int(lm / 1000) if lm else int(time.time())
+        if unpack and (unpacked := unpack_archive_bytes(f.name, raw, zdict)):
+            log("INFO", f"Unpacked '{f.name}' -> {len(unpacked)} entry/entries.")
+            for u_name, u_bytes, _ in unpacked:
+                items.append((u_name, u_bytes, mtime))
+        else:
+            items.append((safe_relpath(rel), raw, mtime))
+        await asyncio.sleep(0)
+    return items
+
+async def run_individual(files, webp_opts, opts, zdict, unpack, checksums, res_el, status_el):
+    items = await collect_inputs(files, unpack, zdict)
+    status_el.textContent = f"{'Converting' if webp_opts else 'Compressing'} {len(items)} item(s)..."
+    ok = fail = skip = 0
+    t0 = time.perf_counter()
+    rows = []
+    for i, (iname, raw, _) in enumerate(items):
+        ft0 = time.perf_counter()
+        log("DEBUG", f"[{i + 1}/{len(items)}] Processing '{iname}' ({fmt_b(len(raw))}, {guess_mime(iname)})...")
+        try:
+            diff_png = None
+            if webp_opts:
+                try:
+                    out, m, diff_png = convert_to_webp(raw, webp_opts)
+                except Exception as exc:
+                    if webp_opts["non_image"] == "skip":
+                        skip += 1
+                        log("WARN", f"[{i + 1}/{len(items)}] Skipped non-image '{iname}': {exc}")
+                        continue
+                    if webp_opts["non_image"] == "include":
+                        log("WARN", f"[{i + 1}/{len(items)}] '{iname}' is not a supported image ({exc}); outputting original file.")
+                        out, name, mime, note = raw, iname, guess_mime(iname), f" (kept original, {fmt_b(len(raw))})"
+                        rows.append([iname, fmt_b(len(raw)), fmt_b(len(out)), "100.0%", "kept", f"{time.perf_counter() - ft0:.3f}s"])
+                    else:
+                        raise
+                else:
+                    name = str(Path(iname).with_suffix(".webp"))
+                    mime = "image/webp"
+                    dt = time.perf_counter() - ft0
+                    ratio = (len(out) / len(raw) * 100) if raw else 0
+                    q_txt = fmt_metrics(m, True)
+                    qt_txt = f" q={m['used_q']}" if webp_opts["target_kb"] > 0 and not webp_opts["lossless"] else ""
+                    note = f" ({m['orig_format']} {m['size']} {m['frames']}f{qt_txt}: {fmt_b(len(raw))} -> {fmt_b(len(out))}, {ratio:.1f}% ratio{q_txt}, {dt:.3f}s)"
+                    log("OK", f"[{i + 1}/{len(items)}] '{iname}' -> '{name}' [{m['orig_format']} {m['orig_mode']}->{m['final_mode']}, {m['size']}, {m['frames']}f{qt_txt}{q_txt}]: {fmt_b(len(raw))} -> {fmt_b(len(out))} ({ratio:.1f}%) in {dt:.3f}s")
+                    rows.append([name, fmt_b(len(raw)), fmt_b(len(out)), f"{ratio:.1f}%", q_txt.lstrip(", ") or "-", f"{dt:.3f}s"])
+            else:
+                out = czstd.compress(raw, options=opts, zstd_dict=zdict)
+                dt = time.perf_counter() - ft0
+                name, mime = f"{iname}.zst", "application/zstd"
+                ratio = (len(out) / len(raw) * 100) if raw else 0
+                mb_s = (len(raw) / 1048576 / dt) if dt > 0 else 0
+                note = f" ({fmt_b(len(raw))} -> {fmt_b(len(out))}, {ratio:.1f}% ratio, {dt:.3f}s)"
+                log("OK", f"[{i + 1}/{len(items)}] '{iname}': {fmt_b(len(raw))} -> {fmt_b(len(out))} ({ratio:.1f}%) in {dt:.3f}s ({mb_s:.2f} MB/s)")
+                rows.append([name, fmt_b(len(raw)), fmt_b(len(out)), f"{ratio:.1f}%", f"{mb_s:.1f} MB/s", f"{dt:.3f}s"])
+            if checksums:
+                sha, crc = digest_info(out)
+                note += f" [sha256:{sha[:12]} crc32:{crc:08x}]"
+            add_li(res_el, name, make_url(out, mime), note)
+            if diff_png is not None:
+                dname = f"{Path(iname).stem}_diff.png"
+                add_li(res_el, dname, make_url(diff_png, "image/png"), f" (8x amplified diff heatmap, {fmt_b(len(diff_png))})")
+            ok += 1
+        except Exception as exc:
+            fail += 1
+            msg = f"Failed '{iname}': {type(exc).__name__}: {exc}"
+            add_li(res_el, err=msg)
+            log("ERROR", f"[{i + 1}/{len(items)}] {msg}")
+            log("ERROR", traceback.format_exc().rstrip())
+        await asyncio.sleep(0)
+    if skip:
+        log("INFO", f"Skipped {skip} non-image file(s).")
+    return ok, fail, time.perf_counter() - t0, rows
+
+async def run_archive(files, webp_opts, opts, zdict, unpack, checksums, arch_fmt, res_el, status_el):
+    items = await collect_inputs(files, unpack, zdict)
+    raw_name = get_val("archive_name") or f"archive.{arch_fmt}"
+    ext_map = {"tar.zst": (".zst", ".tzst"), "zip": (".zip",), "tar.gz": (".tar.gz", ".tgz"), "tar.bz2": (".tar.bz2", ".tbz2"), "tar.xz": (".tar.xz", ".txz")}
+    base = raw_name
+    for suf in (".tar.zst", ".tzst", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz", ".zip", ".zst"):
+        if base.endswith(suf):
+            base = base[:-len(suf)]
+            break
+    name = raw_name if raw_name.endswith(ext_map[arch_fmt]) else f"{base}.{arch_fmt}"
+    status_el.textContent = f"{'Converting to .webp & archiving' if webp_opts else 'Archiving & compressing'} {len(items)} item(s) into '{name}'..."
+    t0 = time.perf_counter()
+    in_b = staged_b = archived = conv = skip = 0
+    seen, staged_entries, sha_lines, rows = set(), [], [], []
+
+    for i, (iname, raw, mtime) in enumerate(items):
+        ft0 = time.perf_counter()
+        in_b += len(raw)
+        eb, en = raw, iname
+        if webp_opts:
+            try:
+                eb, m, diff_png = convert_to_webp(raw, webp_opts)
+                en = str(Path(iname).with_suffix(".webp"))
+                conv += 1
+                wr = (len(eb) / len(raw) * 100) if raw else 0
+                q_txt = fmt_metrics(m, False)
+                log("OK", f"[{i + 1}/{len(items)}] '{iname}' -> '{en}' [{m['orig_format']} {m['size']}, {m['frames']}f{q_txt}]: {fmt_b(len(raw))} -> {fmt_b(len(eb))} ({wr:.1f}%) in {time.perf_counter() - ft0:.3f}s")
+                rows.append([en, fmt_b(len(raw)), fmt_b(len(eb)), f"{wr:.1f}%", q_txt.lstrip(", ") or "-", f"{time.perf_counter() - ft0:.3f}s"])
+                if diff_png is not None:
+                    staged_entries.append((unique_name(f"{Path(iname).stem}_diff.png", seen), diff_png, mtime))
+            except Exception as exc:
+                if webp_opts["non_image"] == "skip":
+                    skip += 1
+                    log("WARN", f"[{i + 1}/{len(items)}] Skipped non-image '{iname}': {exc}")
+                    continue
+                if webp_opts["non_image"] == "include":
+                    log("WARN", f"[{i + 1}/{len(items)}] '{iname}' is not a supported image ({exc}); storing original.")
+                    rows.append([iname, fmt_b(len(raw)), fmt_b(len(raw)), "100.0%", "kept", "-"])
+                else:
+                    raise
+        en = unique_name(en, seen)
+        staged_b += len(eb)
+        if checksums:
+            sha, crc = digest_info(eb)
+            sha_lines.append(f"{sha}  {en}  (crc32={crc:08x}, size={len(eb)})")
+        staged_entries.append((en, eb, mtime))
+        archived += 1
+        await asyncio.sleep(0)
+
+    if not archived:
+        raise RuntimeError("No files remained to archive after skipping non-images.")
+    if checksums and sha_lines:
+        manifest = ("\n".join(sha_lines) + "\n").encode("utf-8")
+        staged_entries.append((unique_name("SHA256SUMS.txt", seen), manifest, int(time.time())))
+
+    if arch_fmt == "zip":
+        zbuf = io.BytesIO()
+        with zipfile.ZipFile(zbuf, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+            for en, eb, _ in staged_entries:
+                zf.writestr(en, eb)
+        comp, mime = zbuf.getvalue(), "application/zip"
+    else:
+        tbuf = io.BytesIO()
+        with tarfile.open(fileobj=tbuf, mode="w") as tf:
+            for en, eb, mtime in staged_entries:
+                ti = tarfile.TarInfo(name=en)
+                ti.size, ti.mode, ti.mtime = len(eb), 0o644, mtime
+                tf.addfile(ti, io.BytesIO(eb))
+        tar_b = tbuf.getvalue()
+        if arch_fmt == "tar.zst":
+            comp, mime = czstd.compress(tar_b, options=opts, zstd_dict=zdict), "application/zstd"
+        elif arch_fmt == "tar.gz":
+            comp, mime = gzip.compress(tar_b), "application/gzip"
+        elif arch_fmt == "tar.bz2":
+            comp, mime = bz2.compress(tar_b), "application/x-bzip2"
+        else:
+            comp, mime = lzma.compress(tar_b), "application/x-xz"
+
+    dt = time.perf_counter() - t0
+    oratio = (len(comp) / in_b * 100) if in_b else 0
+    note = f" ({archived} file(s), {fmt_b(in_b)} -> staged {fmt_b(staged_b)} -> {fmt_b(len(comp))}, {oratio:.1f}% of original, {dt:.3f}s)"
+    if checksums:
+        sha, crc = digest_info(comp)
+        note += f" [sha256:{sha[:12]} crc32:{crc:08x}]"
+    add_li(res_el, name, make_url(comp, mime), note)
+    rows.append([name, fmt_b(in_b), fmt_b(len(comp)), f"{oratio:.1f}%", arch_fmt, f"{dt:.3f}s"])
+    log("OK", f"Archive '{name}' ({arch_fmt}): {archived} file(s) (webp={conv}, skipped={skip}) -> {fmt_b(len(comp))} ({oratio:.1f}%) in {dt:.3f}s")
+    return 1, 0, dt, rows
+
+async def run_decompress(files, zdict, checksums, res_el, status_el):
+    status_el.textContent = f"Extracting / decompressing {files.length} file(s)..."
+    ok = fail = 0
+    t0 = time.perf_counter()
+    rows = []
+    for i in range(files.length):
+        f = files.item(i)
+        try:
+            raw = await read_bytes(f)
+            entries = unpack_archive_bytes(f.name, raw, zdict)
+            if not entries:
+                raise ValueError("Unsupported or unrecognized compressed/archive format.")
+            for ename, eb, _ in entries:
+                sha_note = ""
+                if checksums:
+                    sha, crc = digest_info(eb)
+                    sha_note = f" [sha256:{sha[:12]} crc32:{crc:08x}]"
+                add_li(res_el, ename, make_url(eb, guess_mime(ename)), f" ({fmt_b(len(eb))}{sha_note})")
+                rows.append([ename, fmt_b(len(raw)), fmt_b(len(eb)), "-", guess_mime(ename), "-"])
+                ok += 1
+            log("OK", f"Extracted '{f.name}' -> {len(entries)} file(s).")
+        except Exception as exc:
+            fail += 1
+            msg = f"Failed '{f.name}': {type(exc).__name__}: {exc}"
+            add_li(res_el, err=msg)
+            log("ERROR", msg)
+        await asyncio.sleep(0)
+    return ok, fail, time.perf_counter() - t0, rows
+
+async def run_inspect(files, res_el, status_el):
+    status_el.textContent = f"Inspecting {files.length} file(s)..."
+    t0 = time.perf_counter()
+    for i in range(files.length):
+        f = files.item(i)
+        raw = await read_bytes(f)
+        sha, crc = digest_info(raw)
+        lines = [f"=== {f.name} ({fmt_b(len(raw))}, mime={guess_mime(f.name)}) ===", f"SHA-256: {sha}", f"CRC32: {crc:08x}"]
+        if (zh := parse_zstd_header(raw)):
+            lines.append(f"Zstd frame header: {zh}")
+        if (wc := parse_webp_chunks(raw)):
+            lines.append(f"WebP RIFF chunks (declared={wc['riff_size']}B): {wc['chunks']}")
+        try:
+            with Image.open(io.BytesIO(raw)) as im:
+                lines.append(f"Image: format={im.format}, mode={im.mode}, size={im.size}, n_frames={getattr(im, 'n_frames', 1)}, info_keys={list(im.info.keys())}")
+                if (ex := summarize_exif(im)):
+                    lines.append(f"EXIF: {ex}")
+        except Exception:
+            pass
+        report = "\n".join(lines)
+        log("INFO", report)
+        li = document.createElement("li")
+        pre = document.createElement("pre")
+        pre.className = "bg-zinc-900/70 border border-zinc-800 p-2 rounded text-xs font-mono overflow-x-auto whitespace-pre-wrap"
+        pre.textContent = report
+        li.appendChild(pre)
+        res_el.appendChild(li)
+        await asyncio.sleep(0)
+    return files.length, 0, time.perf_counter() - t0, []
+
+async def compress_files(event):
+    status_el, res_el, resolved_el = el("status"), el("results"), el("resolved-params")
+    status_el.className, res_el.innerHTML, resolved_el.hidden = "", "", True
+    revoke_urls()
+    files = el("file-input").files
+    if files.length == 0:
+        status_el.className, status_el.textContent = "warn", "Please select one or more files first."
+        return log("WARN", "Run clicked with no files selected.")
+    try:
+        mode = get_val("output_mode")
+        unpack = get_val("unpack_archives") == "true"
+        checksums = get_val("include_checksums") == "true"
+        arch_fmt = get_val("archive_format") or "tar.zst"
+        zdict = opts = None
+        df = el("dict-input").files
+        if df.length > 0:
+            d_file = df.item(0)
+            db = await read_bytes(d_file)
+            is_raw = not db.startswith(b"\x37\xa4\x30\xec")
+            zdict = ZstdDict(db, is_raw=is_raw)
+            log("INFO", f"Loaded dictionary '{d_file.name}' ({fmt_b(len(db))}, dict_id={zdict.dict_id}, is_raw={is_raw})")
+
+        if mode == "inspect":
+            ok, fail, dt, rows = await run_inspect(files, res_el, status_el)
+        elif mode == "decompress":
+            ok, fail, dt, rows = await run_decompress(files, zdict, checksums, res_el, status_el)
+        else:
+            webp_opts = parse_webp_options() if mode in ("webp_only", "webp_tar_zst") else None
+            uses_zstd = mode == "zst_individual" or (mode in ("zst_archive", "webp_tar_zst") and arch_fmt == "tar.zst")
+            if uses_zstd:
+                opts = build_zstd_options()
+                czstd.ZstdCompressor(options=opts, zstd_dict=zdict)
+                opts_str = {k.name: repr(v) for k, v in opts.items()}
+                log("INFO", f"Starting job: mode={mode}, format={arch_fmt}, files={files.length}, options={opts_str}")
+            else:
+                log("INFO", f"Starting job: mode={mode}, format={arch_fmt}, files={files.length}")
+            if mode in ("zst_archive", "webp_tar_zst"):
+                ok, fail, dt, rows = await run_archive(files, webp_opts, opts, zdict, unpack, checksums, arch_fmt, res_el, status_el)
+            elif mode in ("zst_individual", "webp_only"):
+                ok, fail, dt, rows = await run_individual(files, webp_opts, opts, zdict, unpack, checksums, res_el, status_el)
+            else:
+                raise ValueError(f"Unknown output_mode: {mode}")
+
+        blocks = []
+        if rows:
+            tbl = format_table(rows, ["File", "Input", "Output", "Ratio", "Metrics / Info", "Time"])
+            blocks.append(tbl)
+            log("INFO", "\n" + tbl)
+        if opts is not None:
+            blocks.append("\n".join(["Applied compression.zstd options:"] + [f"  {p.name} = {v!r}  (bounds: {p.bounds()[0]}..{p.bounds()[1]})" for p, v in opts.items()]))
+        if blocks:
+            resolved_el.textContent = "\n\n".join(blocks)
+            resolved_el.hidden = False
+
+        if fail == 0:
+            status_el.textContent = f"Done! Completed in {dt:.3f}s."
+            log("OK", f"Job finished: {ok} output(s) succeeded, 0 failed in {dt:.3f}s.")
+        elif ok > 0:
+            status_el.className, status_el.textContent = "warn", f"Completed with errors: {ok} succeeded, {fail} failed ({dt:.3f}s)."
+        else:
+            status_el.className, status_el.textContent = "error", f"All {fail} file(s) failed. See Execution Log below."
+    except Exception as exc:
+        status_el.className, status_el.textContent = "error", f"Error ({type(exc).__name__}): {exc}"
+        log("ERROR", f"Fatal error: {type(exc).__name__}: {exc}")
+        log("ERROR", traceback.format_exc().rstrip())
+
+async def install_pypi_pkg(event):
+    pkg = get_val("micropip-pkg")
+    if not pkg:
+        return log("WARN", "Enter a pure-Python PyPI package name to install with micropip.")
+    btn = el("micropip-btn")
+    btn.disabled = True
+    try:
+        log("INFO", f"Installing '{pkg}' via micropip...")
+        await micropip.install(pkg)
+        log("OK", f"Installed '{pkg}' via micropip.")
+    except Exception as exc:
+        log("ERROR", f"micropip.install('{pkg}') failed: {exc}")
+    finally:
+        btn.disabled = False
+
+def log_environment():
+    webp_ok = pil_features.check("webp")
+    try:
+        mp_pkgs = len(micropip.list())
+    except Exception:
+        mp_pkgs = "?"
+    log(
+        "INFO",
+        f"Environment ready: Python {sys.version.split()[0]} ({sys.platform}), "
+        f"stdlib compression.zstd (libzstd {getattr(czstd, 'zstd_version', 'unknown')}, "
+        f"window_log={CompressionParameter.window_log.bounds()}, nb_workers={CompressionParameter.nb_workers.bounds()}), "
+        f"Pillow {getattr(PIL, '__version__', 'unknown')} (webp={webp_ok}, lcms2={pil_features.check('littlecms2')}, "
+        f"webp_anim={pil_features.check('webp_anim')}, webp_mux={pil_features.check('webp_mux')}), "
+        f"NumPy {np.__version__}, scipy={'yes' if ndimage else 'no'}, "
+        f"skimage={'yes' if ssim else 'no'}, tabulate={'yes' if tabulate else 'fallback'}, micropip ({mp_pkgs} pkgs)",
+    )
+    if not webp_ok:
+        log("WARN", "Pillow reports WebP support is NOT enabled in this build!")
+
+el("compress-btn").addEventListener("click", create_proxy(compress_files))
+el("micropip-btn").addEventListener("click", create_proxy(install_pypi_pkg))
+el("reset-btn").addEventListener("click", create_proxy(lambda e: updateCliPreview()))
+el("status").textContent = "Ready."
+log_environment()
+  </script>
+
+  <script type="module">
+    import { createEffect, createMemo, createSignal, createStore, For, onSettled } from "solid-js";
+    import { render } from "@solidjs/web";
+    import html from "@solidjs/html";
+    import { loadPyodide } from "https://cdn.jsdelivr.net/pyodide/v314.0.8/full/pyodide.mjs";
+
+    const AUTO = [["", "Auto"], ["1", "True (1)"], ["0", "False (0)"]];
+    const TF = [["true", "True"], ["false", "False"]];
+    const FT = [["false", "False"], ["true", "True"]];
+    const sel = (id, label, options, tip, def = "") => ({ id, label, kind: "select", options, tip, def });
+    const inp = (id, label, kind, extra, tip, def = "") => ({ id, label, kind, ...extra, tip, def });
+
+    const WEBP_CORE = [
+      sel("webp_lossless", "lossless", [["false", "False (lossy)"], ["true", "True (lossless)"]], "Use lossless WebP compression instead of lossy.", "false"),
+      inp("webp_quality", "quality (0–100)", "number", { min: "0", max: "100" }, "Lossy visual quality or lossless effort (0–100).", "80"),
+      inp("webp_target_kb", "target_max_kb (bisect)", "number", { min: "0", placeholder: "0 (off)" }, "If > 0 in lossy mode, binary-search quality (1..100) via bisect to stay under target KB.", "0"),
+      inp("webp_alpha_quality", "alpha_quality (0–100)", "number", { min: "0", max: "100" }, "Alpha channel quality in lossy mode (0–100).", "100"),
+      inp("webp_method", "method (0–6)", "number", { min: "0", max: "6" }, "Encoder speed/quality trade-off (0=fastest, 6=best).", "4"),
+      sel("webp_exact", "exact", FT, "Preserve RGB under alpha=0 pixels in lossless mode.", "false"),
+      sel("webp_auto_orient", "auto_orient (EXIF)", TF, "Rotate/flip pixels by EXIF Orientation before encoding.", "true"),
+      inp("webp_max_dim", "max_dimension (px)", "number", { min: "0", placeholder: "0 (no resize)" }, "Downscale images proportionally to fit within max_dim x max_dim px (Lanczos).", "0"),
+      sel("webp_metrics", "quality_metrics (PSNR/SSIM)", TF, "Compute RMSE (ImageChops/ImageStat), PSNR (NumPy), and SSIM (scikit-image).", "true"),
+      sel("webp_non_image", "non_image_files", [["include", "Include raw as-is"], ["skip", "Skip with warn"], ["error", "Fail on non-image"]], "How to handle non-image files when WebP conversion is active.", "include"),
+    ];
+
+    const WEBP_EXTRA = [
+      sel("webp_to_srgb", "convert_to_srgb (ImageCms)", FT, "Convert embedded ICC profile (e.g. Display P3/AdobeRGB) to sRGB via PIL.ImageCms.", "false"),
+      inp("webp_contrast", "contrast (ImageEnhance)", "number", { min: "0", step: "0.05" }, "Pre-encode contrast multiplier (1.0 = unchanged).", "1.0"),
+      inp("webp_saturation", "saturation (ImageEnhance)", "number", { min: "0", step: "0.05" }, "Pre-encode color saturation multiplier (1.0 = unchanged).", "1.0"),
+      inp("webp_denoise_sigma", "denoise_sigma (SciPy)", "number", { min: "0", step: "0.1" }, "Optional scipy.ndimage Gaussian denoise sigma on RGB channels before encoding (0 = off).", "0"),
+      sel("webp_sharpen", "pre_filter (ImageFilter)", [["none", "None"], ["sharpen", "SHARPEN"], ["unsharp", "UnsharpMask (1.5, 120%)"]], "Optional Pillow ImageFilter applied before WebP encoding.", "none"),
+      sel("webp_clean_alpha", "clean_alpha (NumPy/SciPy)", [["none", "None"], ["zero_transparent", "Zero RGB if alpha=0"], ["threshold_4", "Zero alpha < 4 & RGB"], ["feather_1px", "Feather alpha (1px)"]], "Scrub or feather alpha channel before encoding.", "none"),
+      inp("webp_watermark", "watermark (ImageDraw)", "text", { placeholder: "Corner text" }, "Draw semi-transparent watermark text in the bottom-right via ImageDraw & ImageFont.", ""),
+      sel("webp_diff_map", "export_diff_heatmap", FT, "Also output an 8x amplified difference heatmap PNG annotated via ImageDraw/ImageFont.", "false"),
+      sel("webp_preserve_icc", "preserve_icc", TF, "Copy embedded ICC profile into output WebP (when convert_to_srgb is False).", "true"),
+      sel("webp_preserve_exif", "preserve_exif", FT, "Copy EXIF metadata into output WebP.", "false"),
+      sel("webp_strip_gps", "strip_exif_gps", TF, "Remove GPS IFD (0x8825) when preserve_exif is True (PIL.ExifTags).", "true"),
+      sel("webp_preserve_xmp", "preserve_xmp", FT, "Copy XMP metadata into output WebP.", "false"),
+      sel("webp_save_all", "save_all (animated)", TF, "Save all frames of animated GIF/APNG/WebP inputs.", "true"),
+      sel("webp_minimize_size", "minimize_size (animated)", FT, "Enable animated WebP size minimization.", "false"),
+      sel("webp_allow_mixed", "allow_mixed (animated)", FT, "Mix lossy/lossless frames in animated WebP.", "false"),
+      inp("webp_loop", "loop (animated)", "number", { min: "0", placeholder: "Auto" }, "Animation loop count (0 = infinite)."),
+      inp("webp_duration", "duration (ms, anim)", "number", { min: "1", placeholder: "Auto" }, "Override frame duration in milliseconds."),
+      inp("webp_background", "background (RGBA)", "text", { placeholder: "e.g. 0,0,0,0" }, "Canvas background R,G,B,A (0–255)."),
+    ];
+
+    const ZSTD_CORE = [
+      inp("compression_level", "compression_level", "number", { min: "-131072", max: "22", placeholder: "-131072..22 (def 3)" }, "Preset trade-off between speed and compression ratio (-131072 to 22).", "3"),
+      sel("strategy", "strategy", [["", "Auto (from level)"], ..."fast dfast greedy lazy lazy2 btlazy2 btopt btultra btultra2".split(" ").map((s, i) => [s, `${i + 1}: ${s}`])], "Match-finding algorithm (compression.zstd.Strategy)."),
+      sel("content_size_flag", "content_size_flag", AUTO, "Write uncompressed size into frame header."),
+      sel("checksum_flag", "checksum_flag", AUTO, "Append 32-bit xxHash-64 frame checksum."),
+      sel("dict_id_flag", "dict_id_flag", AUTO, "Store dictionary ID in frame header."),
+    ];
+
+    const ZSTD_ADV = [
+      inp("window_log", "window_log", "number", { min: "10", max: "30", placeholder: "Auto (10–30)" }, "Base-2 log of max back-reference distance."),
+      inp("hash_log", "hash_log", "number", { min: "6", max: "30", placeholder: "Auto (6–30)" }, "Base-2 log of main hash table size."),
+      inp("chain_log", "chain_log", "number", { min: "6", max: "30", placeholder: "Auto (6–30)" }, "Base-2 log of secondary search/chain table size."),
+      inp("search_log", "search_log", "number", { min: "1", max: "30", placeholder: "Auto (1–30)" }, "Base-2 log of max search probes per position."),
+      inp("min_match", "min_match", "number", { min: "3", max: "7", placeholder: "Auto (3–7)" }, "Minimum match length in bytes (3–7)."),
+      inp("target_length", "target_length", "number", { min: "0", placeholder: "Auto (>= 0)" }, "Strategy-dependent target match length."),
+      sel("enable_long_distance_matching", "enable_ldm", AUTO, "Find repeated blocks up to window_log bytes apart."),
+      inp("ldm_hash_log", "ldm_hash_log", "number", { min: "6", max: "30", placeholder: "Auto (6–30)" }, "Base-2 log of LDM hash table size."),
+      inp("ldm_min_match", "ldm_min_match", "number", { min: "4", max: "4096", placeholder: "Auto (4–4096)" }, "Minimum match length for LDM."),
+      inp("ldm_bucket_size_log", "ldm_bucket_size_log", "number", { min: "1", max: "8", placeholder: "Auto (1–8)" }, "Base-2 log of entries per LDM hash bucket."),
+      inp("ldm_hash_rate_log", "ldm_hash_rate_log", "number", { min: "0", max: "30", placeholder: "Auto (0–30)" }, "Base-2 log of LDM hash insertion rate."),
+      inp("nb_workers", "nb_workers", "number", { min: "0", placeholder: "Auto (0 in wasm32)" }, "Worker threads (bounds 0..0 in Pyodide wasm32)."),
+      inp("job_size", "job_size", "number", { min: "0", placeholder: "Auto" }, "Uncompressed chunk size per worker."),
+      inp("overlap_log", "overlap_log", "number", { min: "0", max: "9", placeholder: "Auto (0–9)" }, "Window overlap fraction between MT jobs."),
+    ];
+
+    const ALL_FIELDS = [...WEBP_CORE, ...WEBP_EXTRA, ...ZSTD_CORE, ...ZSTD_ADV];
+    const DEFAULT_PARAMS = Object.assign(
+      { output_mode: "zst_individual", archive_format: "tar.zst", archive_name: "archive.tar.zst", unpack_archives: "true", include_checksums: "true" },
+      ...ALL_FIELDS.map((f) => ({ [f.id]: f.def }))
+    );
+    const STRATS = "fast dfast greedy lazy lazy2 btlazy2 btopt btultra btultra2".split(" ");
+    const ADV_KEYS = [
+      ["hash_log", "hashLog"], ["chain_log", "chainLog"], ["search_log", "searchLog"],
+      ["min_match", "minMatch"], ["target_length", "targetLength"], ["overlap_log", "overlapLog"],
+      ["ldm_hash_log", "ldmHashLog"], ["ldm_min_match", "ldmMinMatch"],
+      ["ldm_bucket_size_log", "ldmBucketSizeLog"], ["ldm_hash_rate_log", "ldmHashRateLog"],
+    ];
+
+    const shellQuote = (s) => (/^[a-zA-Z0-9._\/-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`);
+
+    function buildZstdCli(p, dictName) {
+      const flags = [], notes = [], adv = [];
+      const lvl = parseInt(p.compression_level.trim() || "3", 10);
+      if (!Number.isNaN(lvl)) {
+        if (lvl < 0) flags.push(`--fast=${Math.abs(lvl)}`);
+        else if (lvl >= 20) flags.push("--ultra", `-${lvl}`);
+        else if (lvl > 0) flags.push(`-${lvl}`);
+      }
+      if (p.content_size_flag === "1") flags.push("--content-size");
+      else if (p.content_size_flag === "0") flags.push("--no-content-size");
+      if (p.checksum_flag === "1") flags.push("--check");
+      else if (p.checksum_flag === "0") flags.push("--no-check");
+      if (p.dict_id_flag === "0") flags.push("--no-dictID");
+      if (dictName) flags.push(`-D ${shellQuote(dictName)}`);
+      const wlog = p.window_log.trim();
+      if (p.enable_long_distance_matching === "1") flags.push(wlog ? `--long=${wlog}` : "--long");
+      else if (p.enable_long_distance_matching === "0") notes.push("# Note: enable_long_distance_matching=0.");
+      const workers = p.nb_workers.trim(), job = p.job_size.trim();
+      if (workers && parseInt(workers, 10) > 0) flags.push(`-T${workers}`);
+      if (job && parseInt(job, 10) > 0) flags.push(`-B${job}`);
+      const si = STRATS.indexOf(p.strategy);
+      if (si >= 0) adv.push(`strategy=${si + 1}`);
+      if (wlog && p.enable_long_distance_matching !== "1") adv.push(`windowLog=${wlog}`);
+      for (const [k, cli] of ADV_KEYS) if (p[k].trim()) adv.push(`${cli}=${p[k].trim()}`);
+      if (adv.length) flags.push(`--zstd=${adv.join(",")}`);
+      return { flagsStr: flags.join(" "), notes };
+    }
+
+    function buildWebpCli(p) {
+      const cw = [], gf = [], notes = [];
+      const lossless = p.webp_lossless === "true", q = p.webp_quality.trim() || "80", aq = p.webp_alpha_quality.trim() || "100", m = p.webp_method.trim() || "4";
+      if (lossless) cw.push("-lossless");
+      else { gf.push("-lossy"); if (aq !== "100") cw.push(`-alpha_q ${aq}`); }
+      if (parseInt(p.webp_target_kb || "0", 10) > 0 && !lossless) cw.push(`-size ${parseInt(p.webp_target_kb, 10) * 1024}`);
+      else { cw.push(`-q ${q}`); gf.push(`-q ${q}`); }
+      cw.push(`-m ${m}`);
+      gf.push(`-m ${m}`);
+      if (p.webp_exact === "true") cw.push("-exact");
+      if (parseInt(p.webp_max_dim || "0", 10) > 0) cw.push(`-resize ${p.webp_max_dim} 0`);
+      const meta = ["icc", "exif", "xmp"].filter((k) => p[`webp_preserve_${k}`] === "true");
+      cw.push(meta.length === 3 ? "-metadata all" : meta.length ? `-metadata ${meta.join(",")}` : "-metadata none");
+      if (p.webp_minimize_size === "true") gf.push("-min_size");
+      if (p.webp_allow_mixed === "true") gf.push("-mixed");
+      if (p.webp_loop.trim()) gf.push(`-loop ${p.webp_loop.trim()}`);
+      if (p.webp_auto_orient === "true") notes.push("# Note: cwebp ignores EXIF Orientation; pre-rotate via ImageOps.exif_transpose.");
+      return { cwebpFlagsStr: cw.join(" "), gifFlagsStr: gf.join(" "), notes };
+    }
+
+    function LabelHead(props) {
+      return html`<span class="label-head"><span>${props.label}</span><span class="tip" tabindex="0">?<span class="tip-text" role="tooltip">${props.tip}</span></span></span>`;
+    }
+
+    const headTpl = html.define({ LabelHead });
+
+    function ParamField(props) {
+      const f = props.field;
+      const ctrl = f.kind === "select"
+        ? headTpl`<select id=${f.id} value=${() => props.value} onChange=${(e) => props.onChange(f.id, e.currentTarget.value)}>${f.options.map(([v, l]) => html`<option value=${v} selected=${() => props.value === v}>${l}</option>`)}</select>`
+        : headTpl`<input id=${f.id} type=${f.kind} min=${f.min} max=${f.max} step=${f.step} placeholder=${f.placeholder} value=${() => props.value} onInput=${(e) => props.onChange(f.id, e.currentTarget.value)} />`;
+      return headTpl`<label><LabelHead label=${f.label} tip=${f.tip} />${ctrl}</label>`;
+    }
+
+    const tpl = html.define({ For, LabelHead, ParamField });
+
+    function App() {
+      const [params, setParams] = createStore({ ...DEFAULT_PARAMS });
+      const [selectedFiles, setSelectedFiles] = createSignal([]);
+      const [selectedDictName, setSelectedDictName] = createSignal("");
+      const [pyReady, setPyReady] = createSignal(false);
+      const [logs, setLogs] = createSignal([]);
+      let fileInputRef, dictInputRef, logContainerRef, webpDetailsRef, zstdDetailsRef, logSeq = 0;
+
+      const updateParam = (id, v) => setParams((d) => { d[id] = v; });
+      const isArchiveMode = createMemo(() => params.output_mode === "zst_archive" || params.output_mode === "webp_tar_zst");
+      const isWebpMode = createMemo(() => params.output_mode === "webp_only" || params.output_mode === "webp_tar_zst");
+      const isZstdMode = createMemo(() => params.output_mode === "zst_individual" || (isArchiveMode() && params.archive_format === "tar.zst"));
+
+      createEffect(
+        () => [isWebpMode(), isZstdMode()],
+        ([w, z]) => {
+          if (webpDetailsRef) webpDetailsRef.open = w;
+          if (zstdDetailsRef) zstdDetailsRef.open = z;
+        }
+      );
+
+      const packCmd = (inputs, arch, fmt, z) => {
+        if (fmt === "zip") return `zip -r ${shellQuote(arch)} ${inputs}`;
+        if (fmt === "tar.gz") return `tar -czf ${shellQuote(arch)} ${inputs}`;
+        if (fmt === "tar.bz2") return `tar -cjf ${shellQuote(arch)} ${inputs}`;
+        if (fmt === "tar.xz") return `tar -cJf ${shellQuote(arch)} ${inputs}`;
+        return `tar -cf - ${inputs} | zstd ${z.flagsStr} -o ${shellQuote(arch)}`.replace(/\s+/g, " ").trim();
+      };
+
+      const cliCommands = createMemo(() => {
+        const mode = params.output_mode, fmt = params.archive_format, files = selectedFiles();
+        const disp = files.length ? files : ["input1.png", "input2.jpg"], quoted = disp.map(shellQuote).join(" ");
+        const arch = params.archive_name.trim() || `archive.${fmt}`;
+        const z = buildZstdCli(params, selectedDictName()), w = buildWebpCli(params), lines = [];
+        if (mode === "zst_individual") {
+          lines.push("# Compress each file individually to <file>.zst:", `zstd ${z.flagsStr} ${quoted}`.replace(/\s+/g, " ").trim(), ...z.notes);
+        } else if (mode === "zst_archive") {
+          lines.push(`# Pack files into ${fmt}:`, packCmd(quoted, arch, fmt, z), ...(fmt === "tar.zst" ? z.notes : []));
+        } else if (mode === "webp_only") {
+          const gifs = disp.filter((f) => /\.gif$/i.test(f));
+          lines.push("# Convert static images to .webp (libwebp):");
+          if (disp.length === 1 && !gifs.length) lines.push(`cwebp ${w.cwebpFlagsStr} ${shellQuote(disp[0])} -o ${shellQuote(disp[0].replace(/\.[^.]+$/, "") + ".webp")}`);
+          else lines.push(`for f in ${quoted}; do`, `  cwebp ${w.cwebpFlagsStr} "$f" -o "\${f%.*}.webp"`, "done");
+          if (gifs.length) lines.push("", "# Animated GIF:", ...gifs.map((gf) => `gif2webp ${w.gifFlagsStr} ${shellQuote(gf)} -o ${shellQuote(gf.replace(/\.[^.]+$/, "") + ".webp")}`));
+          lines.push(...w.notes);
+        } else if (mode === "webp_tar_zst") {
+          const webps = disp.map((f) => shellQuote(f.replace(/\.[^.]+$/, "") + ".webp")).join(" ");
+          lines.push("# 1. Convert images to .webp:", `for f in ${quoted}; do`, `  cwebp ${w.cwebpFlagsStr} "$f" -o "\${f%.*}.webp"`, "done", "", `# 2. Pack .webp files into ${fmt}:`, packCmd(webps, arch, fmt, z), ...w.notes);
+        } else if (mode === "decompress") {
+          lines.push("# Decompress / extract archive:", `# zstd -d ${quoted}  |  unzip / tar -xf ${quoted}`);
+        } else {
+          lines.push("# Inspect hashes, RIFF/Zstd headers, and EXIF:", `sha256sum ${quoted} && exiftool ${quoted}`);
+        }
+        return lines.join("\n");
+      });
+
+      function appendLog(level, message) {
+        const text = `[${new Date().toISOString().slice(11, 23)}] [${level}] ${message}`;
+        setLogs((prev) => [...prev, { id: ++logSeq, level, text }]);
+        (level === "ERROR" ? console.error : level === "WARN" ? console.warn : console.log)(text);
+      }
+
+      createEffect(() => logs().length, () => {
+        if (logContainerRef) logContainerRef.scrollTop = logContainerRef.scrollHeight;
+      });
+
+      globalThis.appendLog = appendLog;
+      globalThis.updateCliPreview = () => {};
+
+      const handleReset = () => {
+        setParams((d) => Object.assign(d, DEFAULT_PARAMS));
+        setSelectedFiles([]);
+        setSelectedDictName("");
+        if (fileInputRef) fileInputRef.value = "";
+        if (dictInputRef) dictInputRef.value = "";
+        appendLog("INFO", "Parameters reset to defaults.");
+      };
+
+      const copyText = async (text, what) => {
+        try { await navigator.clipboard.writeText(text); appendLog("INFO", `Copied ${what} to clipboard.`); }
+        catch (err) { appendLog("ERROR", `Failed to copy ${what}: ${err}`); }
+      };
+
+      onSettled(() => {
+        const onErr = (e) => appendLog("ERROR", `Uncaught JS error: ${e.message} (${e.filename}:${e.lineno})`);
+        const onRej = (e) => appendLog("ERROR", `Unhandled Promise rejection: ${e.reason}`);
+        window.addEventListener("error", onErr);
+        window.addEventListener("unhandledrejection", onRej);
+        (async () => {
+          const t0 = performance.now();
+          appendLog("INFO", "Loading Pyodide 314.0.8 (Python 3.14 + stdlib compression.zstd)...");
+          const pyodide = await loadPyodide();
+          appendLog("INFO", `Pyodide v${pyodide.version} loaded in ${((performance.now() - t0) / 1000).toFixed(2)}s.`);
+          const t1 = performance.now();
+          appendLog("INFO", "Loading pillow, numpy, micropip...");
+          await pyodide.loadPackage(["pillow", "numpy", "micropip"]);
+          for (const pkg of ["scipy", "scikit-image"]) {
+            try {
+              appendLog("INFO", `Loading ${pkg}...`);
+              await pyodide.loadPackage([pkg]);
+            } catch (err) {
+              appendLog("WARN", `Optional package '${pkg}' failed to load: ${err}`);
+            }
+          }
+          try {
+            appendLog("INFO", "Installing tabulate via micropip...");
+            await pyodide.runPythonAsync("import micropip\ntry:\n import tabulate\nexcept ImportError:\n await micropip.install('tabulate')");
+          } catch (err) {
+            appendLog("WARN", `Optional package 'tabulate' failed to install: ${err}`);
+          }
+          appendLog("INFO", `Packages ready in ${((performance.now() - t1) / 1000).toFixed(2)}s.`);
+          await pyodide.runPythonAsync(document.getElementById("python-code").textContent);
+          setPyReady(true);
+        })().catch((err) => {
+          const s = document.getElementById("status");
+          if (s) { s.className = "error"; s.textContent = "Initialization failed: " + err; }
+          appendLog("ERROR", "Initialization failed: " + (err.stack || err));
+        });
+        return () => {
+          window.removeEventListener("error", onErr);
+          window.removeEventListener("unhandledrejection", onRej);
+        };
+      });
+
+      const MODES = [
+        ["zst_individual", "Compress individually (.zst)"],
+        ["zst_archive", "Pack & compress archive"],
+        ["webp_only", "Convert images to .webp"],
+        ["webp_tar_zst", "Convert .webp + archive"],
+        ["decompress", "Decompress / extract"],
+        ["inspect", "Inspect headers & EXIF"],
+      ];
+      const ARCH_FMTS = [["tar.zst", ".tar.zst (Zstd)"], ["zip", ".zip (Deflate)"], ["tar.gz", ".tar.gz (Gzip)"], ["tar.bz2", ".tar.bz2 (Bzip2)"], ["tar.xz", ".tar.xz (LZMA)"]];
+
+      return tpl`
+        <div class="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-zinc-800/80">
+          <div class="flex items-baseline gap-2.5 flex-wrap">
+            <h1 class="text-base font-semibold tracking-tight text-zinc-100">Pyodide 3.14 Zstd &amp; WebP</h1>
+            <span id="status">Loading Pyodide 3.14, Pillow, NumPy, SciPy, scikit-image &amp; tabulate...</span>
+          </div>
+          <div class="flex items-center gap-1.5">
+            <button id="compress-btn" class="btn btn-primary" disabled=${() => !pyReady()}>Run</button>
+            <button id="reset-btn" class="btn" type="button" onClick=${handleReset}>Reset</button>
+          </div>
+        </div>
+
+        <ul id="results" class="list-disc pl-4 mt-1.5 space-y-0.5 text-xs empty:hidden"></ul>
+        <pre id="resolved-params" class="bg-zinc-900/70 border border-zinc-800 text-zinc-200 p-2 rounded-lg overflow-x-auto text-[11px] font-mono mt-2" hidden></pre>
+
+        <section class="panel">
+          <div class="grid-fields">
+            <label>
+              <LabelHead label="Files / archives" tip="Select files, images, or archives (.zip, .tar.zst, .tar.gz, .tar.bz2, .tar.xz)." />
+              <input id="file-input" type="file" multiple ref=${(el) => (fileInputRef = el)} onChange=${(e) => setSelectedFiles(Array.from(e.currentTarget.files || []).map((f) => f.name))} />
+            </label>
+            <label>
+              <LabelHead label="Output mode" tip="Compress, convert to WebP, archive, decompress/extract, or inspect headers & EXIF." />
+              <select id="output_mode" value=${() => params.output_mode} onChange=${(e) => updateParam("output_mode", e.currentTarget.value)}>
+                ${MODES.map(([v, l]) => tpl`<option value=${v} selected=${() => params.output_mode === v}>${l}</option>`)}
+              </select>
+            </label>
+            <label>
+              <LabelHead label="Archive format" tip="Container/codec used in archive modes (compression.zstd, zipfile, gzip, bz2, lzma)." />
+              <select id="archive_format" value=${() => params.archive_format} disabled=${() => !isArchiveMode()} onChange=${(e) => {
+                const fmt = e.currentTarget.value;
+                updateParam("archive_format", fmt);
+                updateParam("archive_name", params.archive_name.replace(/\.(tar\.(zst|gz|bz2|xz)|t(zst|gz|bz2|xz)|zip|zst)$/i, "") + "." + fmt);
+              }}>
+                ${ARCH_FMTS.map(([v, l]) => tpl`<option value=${v} selected=${() => params.archive_format === v}>${l}</option>`)}
+              </select>
+            </label>
+            <label>
+              <LabelHead label="Archive filename" tip="Output filename when creating an archive." />
+              <input id="archive_name" type="text" value=${() => params.archive_name} disabled=${() => !isArchiveMode()} onInput=${(e) => updateParam("archive_name", e.currentTarget.value)} />
+            </label>
+            <label>
+              <LabelHead label="Unpack inputs" tip="Automatically unpack uploaded .zip/.tar.* archives before converting or re-archiving." />
+              <select id="unpack_archives" value=${() => params.unpack_archives} onChange=${(e) => updateParam("unpack_archives", e.currentTarget.value)}>
+                ${TF.map(([v, l]) => tpl`<option value=${v} selected=${() => params.unpack_archives === v}>${l}</option>`)}
+              </select>
+            </label>
+            <label>
+              <LabelHead label="SHA-256 & CRC32" tip="Compute SHA-256 (hashlib) and CRC32 (zlib) digests and include SHA256SUMS.txt in archives." />
+              <select id="include_checksums" value=${() => params.include_checksums} onChange=${(e) => updateParam("include_checksums", e.currentTarget.value)}>
+                ${TF.map(([v, l]) => tpl`<option value=${v} selected=${() => params.include_checksums === v}>${l}</option>`)}
+              </select>
+            </label>
+            <label>
+              <LabelHead label="Zstd dictionary" tip="Optional Zstandard dictionary (compression.zstd.ZstdDict) for compression & decompression." />
+              <input id="dict-input" type="file" ref=${(el) => (dictInputRef = el)} onChange=${(e) => setSelectedDictName(e.currentTarget.files?.[0]?.name || "")} />
+            </label>
+            <label>
+              <LabelHead label="PyPI wheel (micropip)" tip="Install a pure-Python package at runtime via micropip (e.g. piexif, defusedxml)." />
+              <div class="flex gap-1">
+                <input id="micropip-pkg" type="text" placeholder="e.g. piexif" class="flex-1 min-w-0" />
+                <button id="micropip-btn" class="btn-sm" type="button" disabled=${() => !pyReady()}>Install</button>
+              </div>
+            </label>
+          </div>
+        </section>
+
+        <details id="webp-fieldset" class="panel" ref=${(el) => (webpDetailsRef = el)}>
+          <summary class="panel-summary">
+            <span><span class="chev mr-1.5">&#9656;</span>WebP Options <span class="font-normal text-zinc-400">(PIL, ImageCms, SciPy, NumPy, SSIM)</span></span>
+            <span class="text-[11px] font-normal text-zinc-400">${() => isWebpMode() ? "Active" : "Inactive in current mode"}</span>
+          </summary>
+          <div class="grid-fields mt-2">
+            ${WEBP_CORE.map((field) => tpl`<ParamField field=${field} value=${() => params[field.id]} onChange=${updateParam} />`)}
+          </div>
+          <details class="mt-2 pt-2 border-t border-zinc-800/80">
+            <summary class="panel-summary text-[11px] text-zinc-300">
+              <span><span class="chev mr-1.5">&#9656;</span>Enhancement, Alpha, Watermark, Metadata &amp; Animation</span>
+              <span class="font-normal text-zinc-500">${WEBP_EXTRA.length} options</span>
+            </summary>
+            <div class="grid-fields mt-2">
+              ${WEBP_EXTRA.map((field) => tpl`<ParamField field=${field} value=${() => params[field.id]} onChange=${updateParam} />`)}
+            </div>
+          </details>
+        </details>
+
+        <details class="panel" ref=${(el) => (zstdDetailsRef = el)}>
+          <summary class="panel-summary">
+            <span><span class="chev mr-1.5">&#9656;</span>Zstandard Options <span class="font-normal text-zinc-400">(stdlib compression.zstd)</span></span>
+            <span class="text-[11px] font-normal text-zinc-400">${() => isZstdMode() ? "Active" : "Inactive in current mode"}</span>
+          </summary>
+          <div class="grid-fields mt-2">
+            ${ZSTD_CORE.map((field) => tpl`<ParamField field=${field} value=${() => params[field.id]} onChange=${updateParam} />`)}
+          </div>
+          <details class="mt-2 pt-2 border-t border-zinc-800/80">
+            <summary class="panel-summary text-[11px] text-zinc-300">
+              <span><span class="chev mr-1.5">&#9656;</span>Advanced Window, Match Finder, LDM &amp; Multithreading</span>
+              <span class="font-normal text-zinc-500">${ZSTD_ADV.length} options</span>
+            </summary>
+            <div class="grid-fields mt-2">
+              ${ZSTD_ADV.map((field) => tpl`<ParamField field=${field} value=${() => params[field.id]} onChange=${updateParam} />`)}
+            </div>
+          </details>
+        </details>
+
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-2.5 mt-2.5">
+          <div class="panel !my-0 flex flex-col">
+            <div class="flex justify-between items-center mb-1.5">
+              <strong class="text-xs font-semibold text-zinc-200">Equivalent CLI Commands</strong>
+              <button id="copy-cli-btn" class="btn-sm" type="button" onClick=${() => copyText(cliCommands(), "CLI commands")}>Copy CLI</button>
+            </div>
+            <pre id="cli-commands" class="bg-zinc-950 border border-zinc-800 text-zinc-100 p-2 rounded font-mono text-[11px] leading-snug overflow-auto max-h-52 whitespace-pre flex-1">${cliCommands}</pre>
+          </div>
+
+          <div class="panel !my-0 flex flex-col">
+            <div class="flex justify-between items-center mb-1.5">
+              <strong class="text-xs font-semibold text-zinc-200">Execution Log</strong>
+              <div class="flex gap-1.5 items-center">
+                <button id="copy-log-btn" class="btn-sm" type="button" onClick=${() => copyText(logs().map((l) => l.text).join("\n"), "log")}>Copy Log</button>
+                <button id="clear-log-btn" class="btn-sm" type="button" onClick=${() => setLogs([])}>Clear</button>
+              </div>
+            </div>
+            <div id="log-output" ref=${(el) => (logContainerRef = el)} class="bg-zinc-950 border border-zinc-800 text-zinc-200 p-2 rounded font-mono text-[11px] leading-snug max-h-52 overflow-y-auto whitespace-pre-wrap break-words flex-1" aria-live="polite">
+              <For each=${() => logs()}>${(entry) => tpl`<div class=${`log-${entry.level}`}>${entry.text}</div>`}</For>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    render(App, document.getElementById("app"));
+  </script>
+</body>
+</html>
